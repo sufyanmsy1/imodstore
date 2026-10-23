@@ -956,6 +956,14 @@ app.get("/api/apps/:id/download", (req, res) => {
   );
 });
 
+// Render health check
+app.get("/api/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    status: "healthy"
+  });
+});
+
 // Frontend
 app.use(express.static(path.join(ROOT, "public")));
 
