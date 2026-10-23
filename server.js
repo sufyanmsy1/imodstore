@@ -228,7 +228,6 @@ function safeUser(user) {
     isAdmin: !!user.is_admin
   };
 }
-
 function publicApp(appRow) {
   return {
     id: appRow.id,
@@ -322,42 +321,60 @@ const deleteChallenge = db.prepare(`
 `);
 
 async function createAndSendOtp(email, purpose, passwordHash = null) {
+  if (!transporter) {
+    throw new Error("SMTP_NOT_CONFIGURED");
+  }
+
   const now = Date.now();
   const existing = findChallenge.get(email, purpose);
 
-  if (existing && now - existing.last_sent_at < 60_000) {
+  // Resend cooldown: 60 seconds
+  if (existing && now - existing.last_sent_at < 60000) {
     return {
       ok: false,
-      status: 429,
-      error: "Please wait 60 seconds before requesting another OTP."
+      error: "Please wait before requesting another OTP."
     };
   }
 
-  const otp = String(crypto.randomInt(0, 1_000_000))
+  const otp = crypto
+    .randomInt(0, 1000000)
+    .toString()
     .padStart(6, "0");
 
-  // Send first; do not save a new challenge if email delivery fails.
-  await sendOtp(email, purpose, otp);
+  const otpHash = hashOtp(email, purpose, otp);
 
   saveChallenge.run(
     email,
     purpose,
-    hashOtp(email, purpose, otp),
+    otpHash,
     passwordHash,
-    now + 10 * 60_000,
+    now + 10 * 60 * 1000,
     now
   );
+
+  try {
+    await sendOtp(email, purpose, otp);
+  } catch (error) {
+    deleteChallenge.run(email, purpose);
+    throw error;
+  }
 
   return { ok: true };
 }
 
-// Health check
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "iModStore API"
+function smtpError(res, error) {
+  console.error("Email OTP error:", error.message);
+
+  if (error.message === "SMTP_NOT_CONFIGURED") {
+    return res.status(503).json({
+      error: "Email service is not configured. Please contact the administrator."
+    });
+  }
+
+  return res.status(502).json({
+    error: "Could not send the email. Please try again later."
   });
-});
+}
 
 // Request registration OTP
 app.post("/api/auth/request-otp", async (req, res) => {
@@ -373,7 +390,7 @@ app.post("/api/auth/request-otp", async (req, res) => {
 
     if (password.length < 8 || password.length > 128) {
       return res.status(400).json({
-        error: "Password must be 8–128 characters."
+        error: "Password must be between 8 and 128 characters."
       });
     }
 
@@ -384,6 +401,7 @@ app.post("/api/auth/request-otp", async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
+
     const result = await createAndSendOtp(
       email,
       "register",
@@ -391,26 +409,22 @@ app.post("/api/auth/request-otp", async (req, res) => {
     );
 
     if (!result.ok) {
-      return res.status(result.status).json({
+      return res.status(429).json({
         error: result.error
       });
     }
 
-    res.json({
+    return res.json({
       ok: true,
       message: "Verification code sent to your email."
     });
   } catch (error) {
-    console.error("Registration OTP error:", error.message);
-
-    res.status(500).json({
-      error: "Could not send OTP. Check email configuration."
-    });
+    return smtpError(res, error);
   }
 });
 
-// Verify registration OTP and create account
-app.post("/api/auth/verify-otp", (req, res) => {
+// Verify registration OTP
+app.post("/api/auth/verify-otp", async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email);
     const otp = String(req.body.otp || "").trim();
@@ -425,7 +439,7 @@ app.post("/api/auth/verify-otp", (req, res) => {
 
     if (!challenge) {
       return res.status(400).json({
-        error: "Request a new verification code."
+        error: "OTP not found. Please request a new code."
       });
     }
 
@@ -433,7 +447,7 @@ app.post("/api/auth/verify-otp", (req, res) => {
       deleteChallenge.run(email, "register");
 
       return res.status(400).json({
-        error: "OTP expired. Request a new code."
+        error: "OTP expired. Please request a new code."
       });
     }
 
@@ -441,13 +455,13 @@ app.post("/api/auth/verify-otp", (req, res) => {
       deleteChallenge.run(email, "register");
 
       return res.status(429).json({
-        error: "Too many attempts. Request a new OTP."
+        error: "Too many incorrect attempts. Request a new OTP."
       });
     }
 
-    const suppliedHash = hashOtp(email, "register", otp);
+    const submittedHash = hashOtp(email, "register", otp);
 
-    if (!safeHashCompare(suppliedHash, challenge.otp_hash)) {
+    if (!safeHashCompare(challenge.otp_hash, submittedHash)) {
       db.prepare(`
         UPDATE otp_challenges
         SET attempts=attempts+1
@@ -459,15 +473,19 @@ app.post("/api/auth/verify-otp", (req, res) => {
       });
     }
 
-    if (q.userByEmail.get(email)) {
+    if (!challenge.password_hash) {
       deleteChallenge.run(email, "register");
 
-      return res.status(409).json({
-        error: "An account with this email already exists."
+      return res.status(400).json({
+        error: "Registration session expired. Request a new OTP."
       });
     }
 
-    const createAccount = db.transaction(() => {
+    const insert = db.transaction(() => {
+      if (q.userByEmail.get(email)) {
+        throw new Error("EMAIL_EXISTS");
+      }
+
       const result = q.insertUser.run(
         email,
         challenge.password_hash,
@@ -476,44 +494,129 @@ app.post("/api/auth/verify-otp", (req, res) => {
 
       deleteChallenge.run(email, "register");
 
-      return Number(result.lastInsertRowid);
+      return result.lastInsertRowid;
     });
 
-    const userId = createAccount();
+    let userId;
 
-    req.session.regenerate(err => {
-      if (err) {
-        return res.status(500).json({
-          error: "Account created, but session could not start. Please log in."
+    try {
+      userId = insert();
+    } catch (error) {
+      if (error.message === "EMAIL_EXISTS") {
+        return res.status(409).json({
+          error: "An account with this email already exists."
         });
       }
 
-      req.session.userId = userId;
+      throw error;
+    }
 
-      req.session.save(saveErr => {
-        if (saveErr) {
+    req.session.userId = userId;
+
+    return res.json({
+      ok: true,
+      message: "Account created successfully.",
+      user: {
+        id: userId,
+        email
+      }
+    });
+  } catch (error) {
+    console.error("OTP verification error:", error.message);
+
+    return res.status(500).json({
+      error: "Could not verify OTP. Please try again."
+    });
+  }
+});
+// Login
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    const password = String(req.body.password || "");
+
+    if (!validEmail(email) || !password) {
+      return res.status(400).json({
+        error: "Enter your email and password."
+      });
+    }
+
+    const user = q.userByEmail.get(email);
+
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+      return res.status(401).json({
+        error: "Invalid email or password."
+      });
+    }
+
+    req.session.regenerate((err) => {
+      if (err) {
+        console.error("Session error:", err.message);
+
+        return res.status(500).json({
+          error: "Could not create a login session."
+        });
+      }
+
+      req.session.userId = user.id;
+
+      req.session.save((saveError) => {
+        if (saveError) {
+          console.error("Session save error:", saveError.message);
+
           return res.status(500).json({
-            error: "Account created, but session could not start. Please log in."
+            error: "Could not save your login session."
           });
         }
 
-        const user = db.prepare(
-          "SELECT * FROM users WHERE id=?"
-        ).get(userId);
-
-        res.json({
+        return res.json({
           ok: true,
+          message: "Login successful.",
           user: safeUser(user)
         });
       });
     });
   } catch (error) {
-    console.error("Registration verification error:", error.message);
+    console.error("Login error:", error.message);
 
-    res.status(500).json({
-      error: "Could not verify OTP."
+    return res.status(500).json({
+      error: "Login failed. Please try again."
     });
   }
+});
+
+// Current logged-in user
+app.get("/api/auth/me", (req, res) => {
+  const user = currentUser(req);
+
+  if (!user) {
+    return res.status(401).json({
+      error: "Not logged in."
+    });
+  }
+
+  return res.json({
+    ok: true,
+    user
+  });
+});
+
+// Logout
+app.post("/api/auth/logout", (req, res) => {
+  req.session.destroy((error) => {
+    if (error) {
+      return res.status(500).json({
+        error: "Could not log out."
+      });
+    }
+
+    res.clearCookie("connect.sid");
+
+    return res.json({
+      ok: true,
+      message: "Logged out successfully."
+    });
+  });
 });
 
 // Request password-reset OTP
@@ -529,41 +632,37 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
     const user = q.userByEmail.get(email);
 
-    // Use a generic response to avoid exposing account existence.
+    // Avoid revealing whether an email is registered.
     if (!user) {
       return res.json({
         ok: true,
-        message: "If the account exists, a verification code will be sent."
+        message: "If the account exists, a reset code will be sent."
       });
     }
 
     const result = await createAndSendOtp(email, "reset");
 
     if (!result.ok) {
-      return res.status(result.status).json({
+      return res.status(429).json({
         error: result.error
       });
     }
 
-    res.json({
+    return res.json({
       ok: true,
-      message: "If the account exists, a verification code will be sent."
+      message: "If the account exists, a reset code will be sent."
     });
   } catch (error) {
-    console.error("Password reset OTP error:", error.message);
-
-    res.status(500).json({
-      error: "Could not send OTP. Check email configuration."
-    });
+    return smtpError(res, error);
   }
 });
 
-// Verify reset OTP and set new password
+// Verify password-reset OTP and set a new password
 app.post("/api/auth/reset-password", async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email);
     const otp = String(req.body.otp || "").trim();
-    const password = String(req.body.password || "");
+    const newPassword = String(req.body.newPassword || "");
 
     if (!validEmail(email) || !/^\d{6}$/.test(otp)) {
       return res.status(400).json({
@@ -571,9 +670,9 @@ app.post("/api/auth/reset-password", async (req, res) => {
       });
     }
 
-    if (password.length < 8 || password.length > 128) {
+    if (newPassword.length < 8 || newPassword.length > 128) {
       return res.status(400).json({
-        error: "New password must be 8–128 characters."
+        error: "New password must be between 8 and 128 characters."
       });
     }
 
@@ -581,7 +680,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
 
     if (!challenge) {
       return res.status(400).json({
-        error: "Request a new password reset code."
+        error: "Reset code not found. Request a new code."
       });
     }
 
@@ -589,7 +688,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
       deleteChallenge.run(email, "reset");
 
       return res.status(400).json({
-        error: "OTP expired. Request a new code."
+        error: "Reset code expired. Request a new code."
       });
     }
 
@@ -597,13 +696,13 @@ app.post("/api/auth/reset-password", async (req, res) => {
       deleteChallenge.run(email, "reset");
 
       return res.status(429).json({
-        error: "Too many attempts. Request a new OTP."
+        error: "Too many incorrect attempts. Request a new code."
       });
     }
 
-    const suppliedHash = hashOtp(email, "reset", otp);
+    const submittedHash = hashOtp(email, "reset", otp);
 
-    if (!safeHashCompare(suppliedHash, challenge.otp_hash)) {
+    if (!safeHashCompare(challenge.otp_hash, submittedHash)) {
       db.prepare(`
         UPDATE otp_challenges
         SET attempts=attempts+1
@@ -611,7 +710,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
       `).run(email);
 
       return res.status(400).json({
-        error: "Incorrect OTP."
+        error: "Incorrect reset code."
       });
     }
 
@@ -621,107 +720,44 @@ app.post("/api/auth/reset-password", async (req, res) => {
       deleteChallenge.run(email, "reset");
 
       return res.status(400).json({
-        error: "Unable to reset password. Request a new code."
+        error: "Account not found."
       });
     }
 
-    const newHash = await bcrypt.hash(password, 12);
+    const passwordHash = await bcrypt.hash(newPassword, 12);
 
-    const resetPassword = db.transaction(() => {
-      db.prepare(
-        "UPDATE users SET password_hash=? WHERE id=?"
-      ).run(newHash, user.id);
+    const updatePassword = db.transaction(() => {
+      db.prepare(`
+        UPDATE users
+        SET password_hash=?
+        WHERE email=?
+      `).run(passwordHash, email);
 
       deleteChallenge.run(email, "reset");
     });
 
-    resetPassword();
+    updatePassword();
 
-    res.json({
+    return res.json({
       ok: true,
-      message: "Password changed successfully. Please log in again."
+      message: "Password reset successfully. You can now log in."
     });
   } catch (error) {
     console.error("Password reset error:", error.message);
 
-    res.status(500).json({
-      error: "Could not reset password."
+    return res.status(500).json({
+      error: "Could not reset your password. Please try again."
     });
   }
 });
 
-// Disable direct registration to prevent OTP bypass.
+// Disable old direct registration endpoint.
+// Registration must use email OTP.
 app.post("/api/auth/register", (req, res) => {
-  res.status(410).json({
-    error: "Use Email OTP registration."
+  return res.status(410).json({
+    error: "Direct registration is disabled. Use email OTP verification."
   });
 });
-
-// Login
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const email = normalizeEmail(req.body.email);
-    const password = String(req.body.password || "");
-
-    const user = q.userByEmail.get(email);
-
-    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
-      return res.status(401).json({
-        error: "Email or password is incorrect."
-      });
-    }
-
-    req.session.regenerate(err => {
-      if (err) {
-        return res.status(500).json({
-          error: "Could not start session."
-        });
-      }
-
-      req.session.userId = user.id;
-
-      req.session.save(saveErr => {
-        if (saveErr) {
-          return res.status(500).json({
-            error: "Could not start session."
-          });
-        }
-
-        res.json({
-          user: safeUser(user)
-        });
-      });
-    });
-  } catch (error) {
-    console.error("Login error:", error.message);
-
-    res.status(500).json({
-      error: "Login failed."
-    });
-  }
-});
-
-// Current user
-app.get("/api/auth/me", (req, res) => {
-  const user = currentUser(req);
-
-  if (!user) {
-    return res.status(401).json({
-      error: "Not logged in."
-    });
-  }
-
-  res.json({ user });
-});
-
-// Logout
-app.post("/api/auth/logout", (req, res) => {
-  req.session.destroy(() => {
-    res.clearCookie("connect.sid");
-    res.json({ ok: true });
-  });
-});
-
 // Public apps
 app.get("/api/apps", (req, res) => {
   res.json({
@@ -746,6 +782,7 @@ app.get("/api/icons/:file", (req, res) => {
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, UPLOADS),
+
     filename: (req, file, cb) => {
       cb(
         null,
@@ -935,6 +972,7 @@ app.use((err, req, res, next) => {
   });
 });
 
+// Start server
 app.listen(PORT, () => {
   console.log(`iModStore server running on port ${PORT}`);
 });
