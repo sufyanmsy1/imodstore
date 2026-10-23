@@ -129,7 +129,94 @@ async function load(){try{let d=await api("/api/apps");apps=d.apps;render()}catc
 function render(){let q=$("q").value.toLowerCase().trim();let list=apps.filter(a=>(category==="All"||a.category===category)&&(tab!=="Kids"||a.category==="Kids")&&(tab!=="Favorites"||isFav(a.id))&&(`${a.name} ${a.category} ${a.description}`.toLowerCase().includes(q)));if(tab==="Top charts")list=[...list].sort((a,b)=>Number(b.rating||0)-Number(a.rating||0));$("grid").innerHTML=list.map(card).join("");$("empty").style.display=list.length?"none":"block";$("count").textContent=`${list.length} app${list.length===1?"":"s"} shown`;$("gridTitle").textContent=q?`Results for “${esc($("q").value)}”`:tab==="Top charts"?"Top charts":tab==="Kids"?"Apps for kids":tab==="Favorites"?"Your saved apps":category==="All"?"Popular apps":category+" apps";document.querySelectorAll(".chip").forEach(b=>b.classList.toggle("active",b.dataset.cat===category))}
 function modal(title,sub,body){$("dialogTitle").textContent=title;$("dialogSub").textContent=sub;$("dialogBody").innerHTML=body;$("overlay").style.display="flex"}
 function close(){ $("overlay").style.display="none" }
-function login(){modal(user?"Account":"Login / Create account","Use an account to submit apps",user?`<p>Signed in as <b>${esc(user.email)}</b></p><button class="btn danger" id="logout">Log out</button>`:`<form id="authForm"><div class="tabs" role="group" aria-label="Account action"><button type="button" class="active" data-auth="login" aria-pressed="true">Login</button><button type="button" data-auth="register" aria-pressed="false">Create account</button></div><p id="authModeHint" class="auth-mode-hint" aria-live="polite">Login to your existing account.</p><input type="hidden" name="mode" value="login"><label class="field">Email<input name="email" type="email" required autocomplete="email"></label><label class="field">Password<input name="password" type="password" required minlength="8" autocomplete="current-password"></label><button class="btn" id="authSubmit" type="submit">Continue to login</button><p class="notice">Use a unique password. Admin privileges are configured on the server, never in this page.</p></form>`);if(user){$("logout").onclick=async()=>{try{await api("/api/auth/logout",{method:"POST",body:"{}"});user=null;syncAuth();close()}catch(e){alert(e.message)}};return}let form=$("authForm");const modeInput=form.querySelector('input[name="mode"]');const password=form.querySelector('[name="password"]');const submit=form.querySelector('#authSubmit');const hint=form.querySelector('#authModeHint');form.querySelectorAll("[data-auth]").forEach(b=>b.addEventListener("click",()=>{const mode=b.dataset.auth;modeInput.value=mode;form.querySelectorAll("[data-auth]").forEach(x=>{const active=x===b;x.classList.toggle("active",active);x.setAttribute("aria-pressed",String(active))});const registering=mode==="register";password.autocomplete=registering?"new-password":"current-password";submit.textContent=registering?"Create account":"Continue to login";hint.textContent=registering?"Create a new iModStore account. Use a password with at least 8 characters.":"Login to your existing account."}));form.addEventListener("submit",async e=>{e.preventDefault();submit.disabled=true;submit.textContent="Please wait…";let fd=new FormData(form);try{let d=await api("/api/auth/"+fd.get("mode"),{method:"POST",body:JSON.stringify({email:fd.get("email"),password:fd.get("password")})});user=d.user;syncAuth();close();alert("Welcome to iModStore.")}catch(err){alert(err.message)}finally{submit.disabled=false;submit.textContent=modeInput.value==="register"?"Create account":"Continue to login"}})}
+function login(){
+  modal(user?"Account":"Login / Create account","Use an account to submit apps",user
+    ?`<p>Signed in as <b>${esc(user.email)}</b></p><button class="btn danger" id="logout">Log out</button>`
+    :`<form id="authForm">
+      <div class="tabs" role="group" aria-label="Account action">
+        <button type="button" class="active" data-auth="login" aria-pressed="true">Login</button>
+        <button type="button" data-auth="register" aria-pressed="false">Create account</button>
+      </div>
+      <p id="authModeHint" class="auth-mode-hint" aria-live="polite">Login to your existing account.</p>
+      <label class="field">Email<input name="email" type="email" required autocomplete="email"></label>
+      <label class="field" id="passwordField">Password<input name="password" type="password" required minlength="8" autocomplete="current-password"></label>
+      <div id="otpField" class="hidden"><label class="field">Email OTP<input name="otp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"></label></div>
+      <div id="newPasswordField" class="hidden"><label class="field">New password<input name="newPassword" type="password" minlength="8" maxlength="128" autocomplete="new-password"></label></div>
+      <button class="btn" id="authSubmit" type="submit">Continue to login</button>
+      <p><button type="button" id="forgotPassword" class="inline-link" style="border:0;background:none;padding:10px 0;cursor:pointer">Forgot password?</button></p>
+      <p class="notice">Use a unique password. Admin privileges are configured on the server, never in this page.</p>
+    </form>`);
+  if(user){
+    $("logout").onclick=async()=>{try{await api("/api/auth/logout",{method:"POST",body:"{}"});user=null;syncAuth();close()}catch(e){alert(e.message)}};
+    return;
+  }
+  const form=$("authForm");
+  const email=form.querySelector('[name="email"]');
+  const password=form.querySelector('[name="password"]');
+  const otp=form.querySelector('[name="otp"]');
+  const newPassword=form.querySelector('[name="newPassword"]');
+  const submit=$("authSubmit"), hint=$("authModeHint");
+  const passwordField=$("passwordField"), otpField=$("otpField"), newPasswordField=$("newPasswordField");
+  const forgot=$("forgotPassword");
+  let flow="login";
+  function showFlow(next){
+    flow=next;
+    const registering=next==="register";
+    const verifying=next==="verify-register"||next==="reset";
+    const resetting=next==="reset";
+    form.querySelectorAll("[data-auth]").forEach(b=>{
+      const active=(registering||next==="verify-register")?b.dataset.auth==="register":b.dataset.auth==="login";
+      b.classList.toggle("active",active);b.setAttribute("aria-pressed",String(active));
+    });
+    passwordField.classList.toggle("hidden",verifying||next==="forgot");
+    otpField.classList.toggle("hidden",!verifying);
+    newPasswordField.classList.toggle("hidden",!resetting);
+    password.required=!verifying&&next!=="forgot";
+    otp.required=verifying;
+    newPassword.required=resetting;
+    forgot.classList.toggle("hidden",next!=="login");
+    if(next==="login"){hint.textContent="Login to your existing account.";submit.textContent="Continue to login";password.autocomplete="current-password";}
+    if(registering){hint.textContent="Enter your email and choose a password. We’ll email you a 6-digit verification code.";submit.textContent="Send verification code";password.autocomplete="new-password";}
+    if(next==="verify-register"){hint.textContent="Enter the 6-digit code sent to your email to create your account.";submit.textContent="Verify code & create account";}
+    if(next==="forgot"){hint.textContent="Enter your account email to receive a password reset code.";submit.textContent="Send reset code";}
+    if(resetting){hint.textContent="Enter the reset code and choose a new password.";submit.textContent="Reset password";}
+  }
+  form.querySelectorAll("[data-auth]").forEach(b=>b.addEventListener("click",()=>showFlow(b.dataset.auth)));
+  forgot.onclick=()=>showFlow("forgot");
+  form.addEventListener("submit",async e=>{
+    e.preventDefault();
+    submit.disabled=true;
+    try{
+      const em=email.value.trim().toLowerCase();
+      let d;
+      if(flow==="login"){
+        d=await api("/api/auth/login",{method:"POST",body:JSON.stringify({email:em,password:password.value})});
+        user=d.user;syncAuth();close();alert("Welcome to iModStore.");return;
+      }
+      if(flow==="register"){
+        d=await api("/api/auth/request-otp",{method:"POST",body:JSON.stringify({email:em,password:password.value})});
+        showFlow("verify-register");alert(d.message||"Verification code sent to your email.");return;
+      }
+      if(flow==="verify-register"){
+        d=await api("/api/auth/verify-otp",{method:"POST",body:JSON.stringify({email:em,otp:otp.value.trim()})});
+        user=d.user;syncAuth();close();alert("Account created successfully.");return;
+      }
+      if(flow==="forgot"){
+        d=await api("/api/auth/forgot-password",{method:"POST",body:JSON.stringify({email:em})});
+        showFlow("reset");alert(d.message||"If the account exists, a reset code will be sent.");return;
+      }
+      if(flow==="reset"){
+        d=await api("/api/auth/reset-password",{method:"POST",body:JSON.stringify({email:em,otp:otp.value.trim(),newPassword:newPassword.value})});
+        showFlow("login");password.value="";otp.value="";newPassword.value="";
+        alert(d.message||"Password reset successfully. You can now log in.");return;
+      }
+    }catch(err){alert(err.message)}
+    finally{
+      submit.disabled=false;
+      submit.textContent=flow==="login"?"Continue to login":flow==="register"?"Send verification code":flow==="verify-register"?"Verify code & create account":flow==="forgot"?"Send reset code":"Reset password";
+    }
+  });
+}
 function syncAuth(){$("loginTop").textContent=user?"Account":"Login";$("adminNav").classList.toggle("hidden",!user||!user.isAdmin)}
 function submitForm(){if(!user){login();return}modal("Submit an app","Submissions stay pending until an admin approves them",`<form id="appForm"><label class="field">App name *<input name="name" required maxlength="70"></label><label class="field">Category *<select name="category">${cats.map(c=>`<option>${c}</option>`).join("")}</select></label><label class="field">Description *<textarea name="description" required maxlength="500"></textarea></label><label class="field">App icon (PNG/JPG/WebP, max 2 MB)<input name="icon" type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"></label><label class="field">APK file * (.apk, max size set by server)<input name="apk" type="file" accept=".apk,application/vnd.android.package-archive" required></label><label class="field">Version<input name="version" maxlength="30" placeholder="1.0.0"></label><p class="notice">Only submit apps you own or are authorized to distribute. Files will be reviewed; approval does not guarantee safety.</p><button class="btn">Submit for review</button></form>`);$("appForm").onsubmit=async e=>{e.preventDefault();let fd=new FormData(e.target);try{let r=await fetch("/api/apps",{method:"POST",body:fd,credentials:"same-origin"});let d=await r.json();if(!r.ok)throw Error(d.error||"Upload failed");close();alert("Submitted! Your app is pending admin review.");await load()}catch(err){alert(err.message)}}}
 function appDetail(id){let a=apps.find(x=>x.id===id);if(!a)return;const revs=readSet("imodstore_reviews_"+id);modal(a.name,a.category,`<div class="apptop"><div class="icon">${icon(a)}</div><div><h2>${esc(a.name)}</h2><div class="muted">★ ${esc(a.rating||"New")} · ${esc(a.version||"Latest version")}</div></div></div><p>${esc(a.description)}</p><p class="notice">Safety tip: check permissions and developer information before installing any APK. Only install files you trust.</p><div class="row"><a class="btn" style="display:inline-block;text-decoration:none;text-align:center" href="/api/apps/${encodeURIComponent(a.id)}/download" data-download="${esc(a.id)}">Download APK</a><button class="btn light" id="detailFav">${isFav(a.id)?"♥ Saved":"♡ Add to wishlist"}</button></div><div id="downloadStatus" class="hidden"><p>Preparing download…</p><div class="progress"><i id="downloadBar"></i></div><small class="muted">Your browser will manage the actual file download.</small></div><hr><h3>Ratings & reviews</h3><p class="muted">Reviews in this starter are saved on this device only.</p><form id="reviewForm"><label class="field">Your display name<input name="name" maxlength="40" placeholder="Guest" required></label><label class="field">Review<textarea name="text" maxlength="500" placeholder="What did you think?" required></textarea></label><div class="stars" id="ratingStars">${[1,2,3,4,5].map(n=>`<button type="button" data-star="${n}" aria-label="${n} stars">★</button>`).join("")}</div><button class="btn">Post review</button></form><div id="reviewList">${revs.length?revs.map(r=>`<div class="review"><b>${esc(r.name)}</b> <span class="pill">${r.rating}/5 ★</span><p>${esc(r.text)}</p><small class="muted">${esc(r.date)}</small></div>`).join(""):'<p class="muted">No reviews yet. Be the first to review.</p>'}</div>`);reviewDraftRating=5;const stars=$("ratingStars");const paint=()=>stars.querySelectorAll("button").forEach(b=>b.style.opacity=Number(b.dataset.star)<=reviewDraftRating?"1":".35");paint();stars.onclick=e=>{let b=e.target.closest("[data-star]");if(b){reviewDraftRating=Number(b.dataset.star);paint()}};$ ("detailFav").onclick=()=>{toggleFav(id);appDetail(id);render()};$("reviewForm").onsubmit=e=>{e.preventDefault();const fd=new FormData(e.target);const arr=readSet("imodstore_reviews_"+id);arr.unshift({name:String(fd.get("name")).slice(0,40),text:String(fd.get("text")).slice(0,500),rating:reviewDraftRating,date:new Date().toLocaleDateString()});writeSet("imodstore_reviews_"+id,arr.slice(0,50));appDetail(id)};const link=document.querySelector('[data-download]');link.onclick=()=>{const box=$("downloadStatus");box.classList.remove("hidden");const bar=$("downloadBar");let n=0;const t=setInterval(()=>{n+=10;bar.style.width=Math.min(n,100)+"%";if(n>=100){clearInterval(t);box.querySelector("p").textContent="Download started"}},100)}}
