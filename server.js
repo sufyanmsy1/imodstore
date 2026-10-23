@@ -28,7 +28,9 @@ const q = {
  userById: db.prepare("SELECT id,email,is_admin AS isAdmin FROM users WHERE id=?"),
  insertUser: db.prepare("INSERT INTO users(email,password_hash,is_admin) VALUES(?,?,?)"),
  insertApp: db.prepare(`INSERT INTO apps(id,owner_id,name,category,description,version,icon_file,apk_file,apk_original_name,size_bytes,status) VALUES(@id,@owner_id,@name,@category,@description,@version,@icon_file,@apk_file,@apk_original_name,@size_bytes,'pending')`),
-  publicApps: db.prepare(`SELECT id,name,category,description,version,rating,size_bytes,icon_file FROM apps WHERE status='approved' ORDER BY created_at DESC`),: db.prepare(`SELECT id,name,category,description,version,rating,size_bytes,icon_file FROM apps WHERE status='approved' ORDER BY created_at DESC`),: db.prepare(`SELECT id,name,category,description,version,rating,size_bytes AS sizeBytes,icon_file AS iconFile FROM apps WHERE status='approved' ORDER BY created_at DESC`),
+
+publicApps: db.prepare(`SELECT id,name,category,description,version,rating,size_bytes,icon_file FROM apps WHERE status='approved' ORDER BY created_at DESC`),
+
  appById: db.prepare("SELECT * FROM apps WHERE id=?"),
  pending: db.prepare(`SELECT a.id,a.name,a.category,a.description,a.version,a.created_at AS createdAt,u.email AS ownerEmail FROM apps a JOIN users u ON u.id=a.owner_id WHERE a.status='pending' ORDER BY a.created_at ASC`),
  review: db.prepare("UPDATE apps SET status=?,review_note=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'")
