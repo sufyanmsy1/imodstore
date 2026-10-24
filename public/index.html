@@ -162,26 +162,28 @@ function login(){
   function showFlow(next){
     flow=next;
     const registering=next==="register";
-    const verifying=next==="verify-register"||next==="reset";
+    const verifying=next==="verify-register"||next==="reset"||next==="login-otp";
     const resetting=next==="reset";
     form.querySelectorAll("[data-auth]").forEach(b=>{
       const active=(registering||next==="verify-register")?b.dataset.auth==="register":b.dataset.auth==="login";
       b.classList.toggle("active",active);b.setAttribute("aria-pressed",String(active));
     });
-    passwordField.classList.toggle("hidden",verifying||next==="forgot");
+    passwordField.classList.toggle("hidden",verifying||next==="forgot"||next==="login"||next==="login-otp");
     otpField.classList.toggle("hidden",!verifying);
     newPasswordField.classList.toggle("hidden",!resetting);
-    password.required=!verifying&&next!=="forgot";
+    password.required=registering;
     otp.required=verifying;
     newPassword.required=resetting;
     forgot.classList.toggle("hidden",next!=="login");
-    if(next==="login"){hint.textContent="Login to your existing account.";submit.textContent="Continue to login";password.autocomplete="current-password";}
+    if(next==="login"){hint.textContent="Enter your email and we’ll send you a 6-digit login code.";submit.textContent="Send login code";}
     if(registering){hint.textContent="Enter your email and choose a password. We’ll email you a 6-digit verification code.";submit.textContent="Send verification code";password.autocomplete="new-password";}
     if(next==="verify-register"){hint.textContent="Enter the 6-digit code sent to your email to create your account.";submit.textContent="Verify code & create account";}
+    if(next==="login-otp"){hint.textContent="Enter the 6-digit login code sent to your email.";submit.textContent="Verify code & login";}
     if(next==="forgot"){hint.textContent="Enter your account email to receive a password reset code.";submit.textContent="Send reset code";}
     if(resetting){hint.textContent="Enter the reset code and choose a new password.";submit.textContent="Reset password";}
   }
   form.querySelectorAll("[data-auth]").forEach(b=>b.addEventListener("click",()=>showFlow(b.dataset.auth)));
+  showFlow("login");
   forgot.onclick=()=>showFlow("forgot");
   form.addEventListener("submit",async e=>{
     e.preventDefault();
@@ -190,7 +192,11 @@ function login(){
       const em=email.value.trim().toLowerCase();
       let d;
       if(flow==="login"){
-        d=await api("/api/auth/login",{method:"POST",body:JSON.stringify({email:em,password:password.value})});
+        d=await api("/api/auth/request-login-otp",{method:"POST",body:JSON.stringify({email:em})});
+        showFlow("login-otp");alert(d.message||"If an account exists, a login code will be sent.");return;
+      }
+      if(flow==="login-otp"){
+        d=await api("/api/auth/verify-login-otp",{method:"POST",body:JSON.stringify({email:em,otp:otp.value.trim()})});
         user=d.user;syncAuth();close();alert("Welcome to iModStore.");return;
       }
       if(flow==="register"){
