@@ -243,7 +243,7 @@ function safeUser(user) {
   return { id: user.id, email: user.email, isAdmin: user.is_admin === true || user.is_admin === 1 };
 }
 function publicApp(appRow) {
-  return { id: appRow.id, name: appRow.name, category: appRow.category, description: appRow.description, version: appRow.version || "", rating: appRow.rating || "New", size: (Number(appRow.size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB", iconUrl: appRow.icon_file ? "/api/icons/" + encodeURIComponent(appRow.id) + "/" + encodeURIComponent(path.basename(appRow.icon_file)) : null };
+  return { id: appRow.id, name: appRow.name, category: appRow.category, description: appRow.description, version: appRow.version || "", rating: appRow.rating || "New", size: appRow.download_url ? "MediaFire" : (Number(appRow.size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB", iconUrl: appRow.icon_file ? "/api/icons/" + encodeURIComponent(appRow.id) + "/" + encodeURIComponent(path.basename(appRow.icon_file)) : null };
 }
 
 function removeFiles(files) {
@@ -815,101 +815,60 @@ const upload = multer({
   }
 });
 
-// Submit app
+// Submit app using a MediaFire share URL instead of uploading the APK.
 app.post("/api/apps", requireAuth, (req, res) => {
-  upload.fields([
-    { name: "apk", maxCount: 1 },
-    { name: "icon", maxCount: 1 }
-  ])(req, res, async err => {
+  upload.fields([{ name: "icon", maxCount: 1 }])(req, res, async err => {
     if (err) {
       removeFiles(req.files);
-
-      return res.status(400).json({
-        error: err.code === "LIMIT_FILE_SIZE"
-          ? "File too large. Maximum upload size is 100 MB."
-          : err.message
-      });
+      return res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "File too large. Maximum upload size is 100 MB." : err.message });
     }
 
-    const uploadedStoragePaths = [];
+    let iconPath = null;
     try {
       const name = String(req.body.name || "").trim();
       const category = String(req.body.category || "");
       const description = String(req.body.description || "").trim();
       const version = String(req.body.version || "").trim();
-
-      const apk = req.files?.apk?.[0];
+      const downloadUrl = String(req.body.downloadUrl || "").trim();
       const icon = req.files?.icon?.[0];
 
+      let parsedUrl;
+      try { parsedUrl = new URL(downloadUrl); } catch (_) {}
+      if (!parsedUrl || parsedUrl.protocol !== "https:" || !["mediafire.com", "www.mediafire.com", "mfi.re"].includes(parsedUrl.hostname.toLowerCase())) {
+        removeFiles(req.files);
+        return res.status(400).json({ error: "Enter a valid HTTPS MediaFire share link." });
+      }
+      if (!name || name.length > 70 || !allowedCats.has(category) || !description || description.length > 500 || downloadUrl.length > 2048) {
+        removeFiles(req.files);
+        return res.status(400).json({ error: "Check the app name, category, description, and MediaFire link." });
+      }
       if (icon && icon.size > 2 * 1024 * 1024) {
         removeFiles(req.files);
-
-        return res.status(400).json({
-          error: "App icon must be 2 MB or smaller."
-        });
+        return res.status(400).json({ error: "App icon must be 2 MB or smaller." });
       }
 
-      if (
-        !name ||
-        name.length > 70 ||
-        !allowedCats.has(category) ||
-        !description ||
-        description.length > 500 ||
-        !apk
-      ) {
-        removeFiles(req.files);
-
-        return res.status(400).json({
-          error: "Check required fields and file uploads."
-        });
-      }
-
-      if (!supabaseUrl || !supabaseServiceKey) throw new Error("SUPABASE_NOT_CONFIGURED");
-      if (apk.size > 50 * 1024 * 1024) {
-        removeFiles(req.files);
-        return res.status(400).json({ error: "APK exceeds the Supabase bucket's 50 MB limit." });
-      }
       const id = crypto.randomUUID();
-      const apkPath = `${id}/${crypto.randomUUID()}${path.extname(apk.originalname).toLowerCase()}`;
-      await uploadToSupabase(apk.path, apkPath, "application/vnd.android.package-archive");
-      uploadedStoragePaths.push(apkPath);
-      let iconPath = null;
       if (icon) {
+        if (!supabaseUrl || !supabaseServiceKey) throw new Error("SUPABASE_NOT_CONFIGURED");
         iconPath = `${id}/${crypto.randomUUID()}${path.extname(icon.originalname).toLowerCase()}`;
-        const iconType = icon.mimetype || "application/octet-stream";
-        await uploadToSupabase(icon.path, iconPath, iconType);
-        uploadedStoragePaths.push(iconPath);
+        await uploadToSupabase(icon.path, iconPath, icon.mimetype || "application/octet-stream");
       }
       const owner = await userById(req.session.userId);
       if (!owner) throw new Error("SESSION_USER_NOT_FOUND");
-      const appRow = {
-        id,
-        owner_id: req.session.userId,
-        owner_email: owner.email,
-        name,
-        category,
-        description,
-        version: version.slice(0, 30),
-        icon_file: iconPath,
-        apk_file: apkPath,
-        apk_original_name: path.basename(apk.originalname),
-        size_bytes: apk.size,
-        status: "pending",
-        rating: "New",
-        review_note: "",
-        created_at: new Date().toISOString(),
-        reviewed_at: null
-      };
-      await saveApp(appRow);
+      await saveApp({
+        id, owner_id: req.session.userId, owner_email: owner.email,
+        name, category, description, version: version.slice(0, 30),
+        icon_file: iconPath, apk_file: null, download_url: downloadUrl,
+        apk_original_name: "", size_bytes: 0, status: "pending", rating: "New",
+        review_note: "", created_at: new Date().toISOString(), reviewed_at: null
+      });
       removeFiles(req.files);
-      res.status(201).json({ ok: true, id, status: "pending" });
+      return res.status(201).json({ ok: true, id, status: "pending" });
     } catch (error) {
       removeFiles(req.files);
-      await deleteSupabaseObjects(uploadedStoragePaths);
+      if (iconPath) await deleteSupabaseObjects([iconPath]);
       console.error("App submission error:", error.message);
-      res.status(error.message === "SUPABASE_NOT_CONFIGURED" ? 503 : 500).json({
-        error: error.message === "SUPABASE_NOT_CONFIGURED" ? "Supabase Storage is not configured on the server." : "Could not save submission. Check server logs."
-      });
+      return res.status(error.message === "SUPABASE_NOT_CONFIGURED" ? 503 : 500).json({ error: error.message === "SUPABASE_NOT_CONFIGURED" ? "Supabase Storage is not configured for app icons." : "Could not save submission. Check server logs." });
     }
   });
 });
@@ -958,16 +917,20 @@ app.patch("/api/admin/apps/:id", requireAuth, requireAdmin, async (req, res) => 
   }
 });
 
-// Download approved APK
+// Download approved app: redirect to its validated MediaFire share URL.
 app.get("/api/apps/:id/download", async (req, res) => {
   try {
     const appRow = await getAppById(req.params.id);
     if (!appRow || appRow.status !== "approved") return res.status(404).json({ error: "Approved app not found." });
-    const signedUrl = await createStorageSignedUrl(appRow.apk_file, 300);
-    res.redirect(302, signedUrl);
+    let target;
+    try { target = new URL(String(appRow.download_url || "")); } catch (_) {}
+    if (!target || target.protocol !== "https:" || !["mediafire.com", "www.mediafire.com", "mfi.re"].includes(target.hostname.toLowerCase())) {
+      return res.status(404).json({ error: "MediaFire download link unavailable." });
+    }
+    return res.redirect(302, target.toString());
   } catch (error) {
-    console.error("APK download failed:", error.message);
-    res.status(error.message === "SUPABASE_NOT_CONFIGURED" ? 503 : 404).json({ error: "APK file unavailable." });
+    console.error("APK download redirect failed:", error.message);
+    return res.status(500).json({ error: "Could not open the download link." });
   }
 });
 
