@@ -139,6 +139,16 @@ const q = {
   `)
 };
 
+// Promote only the explicitly configured account to admin.
+// Set ADMIN_EMAIL in Render to an email that has already registered.
+const configuredAdminEmail = normalizeEmail(process.env.ADMIN_EMAIL);
+if (configuredAdminEmail) {
+  const promoteAdmin = db.prepare("UPDATE users SET is_admin=1 WHERE email=?");
+  const result = promoteAdmin.run(configuredAdminEmail);
+  if (result.changes) console.log(`Admin access enabled for ${configuredAdminEmail}`);
+  else console.log(`ADMIN_EMAIL is configured; register ${configuredAdminEmail} first, then redeploy/restart.`);
+}
+
 const allowedCats = new Set([
   "Games", "Productivity", "Photography", "Education",
   "Entertainment", "Tools", "Kids", "Social", "Health & fitness",
@@ -906,6 +916,20 @@ app.post("/api/apps", requireAuth, (req, res) => {
       res.status(500).json({
         error: "Could not save submission."
       });
+    }
+  });
+});
+
+// Admin dashboard summary
+app.get("/api/admin/stats", requireAuth, requireAdmin, (req, res) => {
+  const count = (sql) => db.prepare(sql).get().count;
+  res.json({
+    stats: {
+      totalUsers: count("SELECT COUNT(*) AS count FROM users"),
+      totalApps: count("SELECT COUNT(*) AS count FROM apps"),
+      pendingApps: count("SELECT COUNT(*) AS count FROM apps WHERE status='pending'"),
+      approvedApps: count("SELECT COUNT(*) AS count FROM apps WHERE status='approved'"),
+      rejectedApps: count("SELECT COUNT(*) AS count FROM apps WHERE status='rejected'")
     }
   });
 });
