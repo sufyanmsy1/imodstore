@@ -6,7 +6,6 @@ const bcrypt = require("bcryptjs");
 const session = require("express-session");
 const SQLiteStore = require("connect-sqlite3")(session);
 const Database = require("better-sqlite3");
-const nodemailer = require("nodemailer");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
@@ -163,27 +162,10 @@ app.use(session({
   }
 }));
 
-// Email configuration
-const smtpPort = Number(process.env.SMTP_PORT || 587);
-
-let transporter = null;
-
-if (
-  process.env.SMTP_HOST &&
-  process.env.SMTP_USER &&
-  process.env.SMTP_PASS &&
-  process.env.SMTP_FROM
-) {
-  transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: smtpPort,
-    secure: smtpPort === 465,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS
-    }
-  });
-}
+// Email configuration via Resend API (Node 22 includes fetch).
+// Set RESEND_API_KEY and RESEND_FROM in Render Environment Variables.
+const resendApiKey = process.env.RESEND_API_KEY;
+const resendFrom = process.env.RESEND_FROM;
 
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
@@ -269,36 +251,34 @@ function safeHashCompare(a, b) {
 }
 
 async function sendOtp(email, purpose, otp) {
-  const from = process.env.EMAIL_FROM || process.env.SMTP_FROM;
-  const subject = purpose === "reset"
-    ? "Your iModStore password reset code"
-    : "Your iModStore sign-in code";
-  const textBody = `Your iModStore code is ${otp}.\n\nIt expires in 10 minutes. Do not share this code with anyone.`;
-  const htmlBody = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto"><h2>iModStore</h2><p>Your verification code is:</p><div style="font-size:32px;font-weight:bold;letter-spacing:8px">${otp}</div><p>This code expires in 10 minutes.</p><p>If you did not request this code, ignore this email.</p></div>`;
-
-  // Prefer Resend API. Gmail SMTP remains as an optional fallback.
-  if (process.env.RESEND_API_KEY) {
-    if (!from) throw new Error("EMAIL_FROM_NOT_CONFIGURED");
-    const response = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ from, to: [email], subject, text: textBody, html: htmlBody })
-    });
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      console.error("Resend API error:", response.status, JSON.stringify(result));
-      throw new Error("RESEND_SEND_FAILED");
-    }
-    return result;
+  if (!resendApiKey || !resendFrom) {
+    throw new Error("RESEND_NOT_CONFIGURED");
   }
 
-  if (transporter && process.env.SMTP_FROM) {
-    return transporter.sendMail({ from: process.env.SMTP_FROM, to: email, subject, text: textBody, html: htmlBody });
+  const subject = purpose === "register"
+    ? "Your iModStore verification code"
+    : "Your iModStore password reset code";
+
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${resendApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      from: resendFrom,
+      to: [email],
+      subject,
+      text: `Your iModStore verification code is ${otp}.\\n\\nIt expires in 10 minutes. Do not share this code with anyone.`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto"><h2>iModStore</h2><p>Your verification code is:</p><div style="font-size:32px;font-weight:bold;letter-spacing:8px">${otp}</div><p>This code expires in 10 minutes.</p><p>If you did not request this code, ignore this email.</p></div>`
+    })
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    console.error("Resend API error:", response.status, detail.slice(0, 500));
+    throw new Error("RESEND_SEND_FAILED");
   }
-  throw new Error("EMAIL_SERVICE_NOT_CONFIGURED");
 }
 
 const findChallenge = db.prepare(`
@@ -326,8 +306,8 @@ const deleteChallenge = db.prepare(`
 `);
 
 async function createAndSendOtp(email, purpose, passwordHash = null) {
-  if (!process.env.RESEND_API_KEY && !(transporter && process.env.SMTP_FROM)) {
-    throw new Error("EMAIL_SERVICE_NOT_CONFIGURED");
+  if (!transporter) {
+    throw new Error("SMTP_NOT_CONFIGURED");
   }
 
   const now = Date.now();
@@ -370,11 +350,10 @@ async function createAndSendOtp(email, purpose, passwordHash = null) {
 function smtpError(res, error) {
   console.error("Email OTP error:", error.message);
 
-  if (["SMTP_NOT_CONFIGURED", "EMAIL_SERVICE_NOT_CONFIGURED", "EMAIL_FROM_NOT_CONFIGURED"].includes(error.message)) {
-    return res.status(503).json({ error: "Email service is not configured. Please contact the administrator." });
-  }
-  if (error.message === "RESEND_SEND_FAILED") {
-    return res.status(502).json({ error: "Email provider rejected the message. Check Resend sender verification and API key in Render." });
+  if (error.message === "RESEND_NOT_CONFIGURED") {
+    return res.status(503).json({
+      error: "Resend email service is not configured. Please contact the administrator."
+    });
   }
 
   return res.status(502).json({
@@ -535,64 +514,7 @@ app.post("/api/auth/verify-otp", async (req, res) => {
     });
   }
 });
-// Passwordless email OTP: any valid email can create an account or sign in.
-app.post("/api/auth/request-login-otp", async (req, res) => {
-  try {
-    const email = normalizeEmail(req.body.email);
-    if (!validEmail(email)) return res.status(400).json({ error: "Enter a valid email address." });
-    const result = await createAndSendOtp(email, "login");
-    if (!result.ok) return res.status(429).json({ error: result.error });
-    return res.json({ ok: true, message: "If the email can receive messages, a sign-in code has been sent." });
-  } catch (error) {
-    return smtpError(res, error);
-  }
-});
-
-app.post("/api/auth/verify-login-otp", async (req, res) => {
-  try {
-    const email = normalizeEmail(req.body.email);
-    const otp = String(req.body.otp || "").trim();
-    if (!validEmail(email) || !/^\d{6}$/.test(otp)) return res.status(400).json({ error: "Enter a valid email and 6-digit code." });
-    const challenge = findChallenge.get(email, "login");
-    if (!challenge) return res.status(400).json({ error: "Code not found. Request a new code." });
-    if (Date.now() > challenge.expires_at) { deleteChallenge.run(email, "login"); return res.status(400).json({ error: "Code expired. Request a new code." }); }
-    if (challenge.attempts >= 5) { deleteChallenge.run(email, "login"); return res.status(429).json({ error: "Too many incorrect attempts. Request a new code." }); }
-    const submittedHash = hashOtp(email, "login", otp);
-    if (!safeHashCompare(challenge.otp_hash, submittedHash)) {
-      db.prepare("UPDATE otp_challenges SET attempts=attempts+1 WHERE email=? AND purpose='login'").run(email);
-      return res.status(400).json({ error: "Incorrect code." });
-    }
-
-    let user = q.userByEmail.get(email);
-    if (!user) {
-      // Existing schema requires a password hash. New OTP-only users receive an
-      // unguessable random password hash and cannot use password login with it.
-      const randomSecret = crypto.randomBytes(48).toString("hex");
-      const passwordHash = await bcrypt.hash(randomSecret, 12);
-      try {
-        const created = q.insertUser.run(email, passwordHash, 0);
-        user = q.userByEmail.get(email);
-      } catch (e) {
-        user = q.userByEmail.get(email);
-        if (!user) throw e;
-      }
-    }
-    deleteChallenge.run(email, "login");
-    req.session.regenerate((err) => {
-      if (err) { console.error("Session regenerate error:", err.message); return res.status(500).json({ error: "Could not create a login session." }); }
-      req.session.userId = user.id;
-      req.session.save((saveError) => {
-        if (saveError) { console.error("Session save error:", saveError.message); return res.status(500).json({ error: "Could not save your login session." }); }
-        return res.json({ ok: true, message: "Signed in successfully.", user: safeUser(user) });
-      });
-    });
-  } catch (error) {
-    console.error("Email OTP sign-in error:", error.message);
-    return res.status(500).json({ error: "Could not verify the code. Please try again." });
-  }
-});
-
-// Legacy password login retained for existing accounts and admin recovery.
+// Login
 app.post("/api/auth/login", async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email);
@@ -729,4 +651,321 @@ app.post("/api/auth/reset-password", async (req, res) => {
 
     if (!validEmail(email) || !/^\d{6}$/.test(otp)) {
       return res.status(400).json({
- 
+        error: "Enter a valid email and 6-digit OTP."
+      });
+    }
+
+    if (newPassword.length < 8 || newPassword.length > 128) {
+      return res.status(400).json({
+        error: "New password must be between 8 and 128 characters."
+      });
+    }
+
+    const challenge = findChallenge.get(email, "reset");
+
+    if (!challenge) {
+      return res.status(400).json({
+        error: "Reset code not found. Request a new code."
+      });
+    }
+
+    if (Date.now() > challenge.expires_at) {
+      deleteChallenge.run(email, "reset");
+
+      return res.status(400).json({
+        error: "Reset code expired. Request a new code."
+      });
+    }
+
+    if (challenge.attempts >= 5) {
+      deleteChallenge.run(email, "reset");
+
+      return res.status(429).json({
+        error: "Too many incorrect attempts. Request a new code."
+      });
+    }
+
+    const submittedHash = hashOtp(email, "reset", otp);
+
+    if (!safeHashCompare(challenge.otp_hash, submittedHash)) {
+      db.prepare(`
+        UPDATE otp_challenges
+        SET attempts=attempts+1
+        WHERE email=? AND purpose='reset'
+      `).run(email);
+
+      return res.status(400).json({
+        error: "Incorrect reset code."
+      });
+    }
+
+    const user = q.userByEmail.get(email);
+
+    if (!user) {
+      deleteChallenge.run(email, "reset");
+
+      return res.status(400).json({
+        error: "Account not found."
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+
+    const updatePassword = db.transaction(() => {
+      db.prepare(`
+        UPDATE users
+        SET password_hash=?
+        WHERE email=?
+      `).run(passwordHash, email);
+
+      deleteChallenge.run(email, "reset");
+    });
+
+    updatePassword();
+
+    return res.json({
+      ok: true,
+      message: "Password reset successfully. You can now log in."
+    });
+  } catch (error) {
+    console.error("Password reset error:", error.message);
+
+    return res.status(500).json({
+      error: "Could not reset your password. Please try again."
+    });
+  }
+});
+
+// Disable old direct registration endpoint.
+// Registration must use email OTP.
+app.post("/api/auth/register", (req, res) => {
+  return res.status(410).json({
+    error: "Direct registration is disabled. Use email OTP verification."
+  });
+});
+// Public apps
+app.get("/api/apps", (req, res) => {
+  res.json({
+    apps: q.publicApps.all().map(publicApp)
+  });
+});
+
+// App icons
+app.get("/api/icons/:file", (req, res) => {
+  const file = path.basename(req.params.file);
+  const filePath = path.join(UPLOADS, file);
+
+  if (!fs.existsSync(filePath)) {
+    return res.sendStatus(404);
+  }
+
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  res.sendFile(filePath);
+});
+
+// Upload configuration
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOADS),
+
+    filename: (req, file, cb) => {
+      cb(
+        null,
+        crypto.randomUUID() +
+        path.extname(file.originalname).toLowerCase()
+      );
+    }
+  }),
+
+  limits: {
+    fileSize: 100 * 1024 * 1024,
+    files: 2
+  },
+
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+
+    if (file.fieldname === "apk" && ext === ".apk") {
+      return cb(null, true);
+    }
+
+    if (
+      file.fieldname === "icon" &&
+      [".png", ".jpg", ".jpeg", ".webp"].includes(ext)
+    ) {
+      return cb(null, true);
+    }
+
+    cb(new Error(
+      "Invalid file type. APK must end in .apk; icon must be PNG, JPG, or WebP."
+    ));
+  }
+});
+
+// Submit app
+app.post("/api/apps", requireAuth, (req, res) => {
+  upload.fields([
+    { name: "apk", maxCount: 1 },
+    { name: "icon", maxCount: 1 }
+  ])(req, res, err => {
+    if (err) {
+      removeFiles(req.files);
+
+      return res.status(400).json({
+        error: err.code === "LIMIT_FILE_SIZE"
+          ? "File too large. Maximum upload size is 100 MB."
+          : err.message
+      });
+    }
+
+    try {
+      const name = String(req.body.name || "").trim();
+      const category = String(req.body.category || "");
+      const description = String(req.body.description || "").trim();
+      const version = String(req.body.version || "").trim();
+
+      const apk = req.files?.apk?.[0];
+      const icon = req.files?.icon?.[0];
+
+      if (icon && icon.size > 2 * 1024 * 1024) {
+        removeFiles(req.files);
+
+        return res.status(400).json({
+          error: "App icon must be 2 MB or smaller."
+        });
+      }
+
+      if (
+        !name ||
+        name.length > 70 ||
+        !allowedCats.has(category) ||
+        !description ||
+        description.length > 500 ||
+        !apk
+      ) {
+        removeFiles(req.files);
+
+        return res.status(400).json({
+          error: "Check required fields and file uploads."
+        });
+      }
+
+      const id = crypto.randomUUID();
+
+      q.insertApp.run({
+        id,
+        owner_id: req.session.userId,
+        name,
+        category,
+        description,
+        version: version.slice(0, 30),
+        icon_file: icon ? icon.filename : null,
+        apk_file: apk.filename,
+        apk_original_name: path.basename(apk.originalname),
+        size_bytes: apk.size
+      });
+
+      res.status(201).json({
+        ok: true,
+        id,
+        status: "pending"
+      });
+    } catch (error) {
+      removeFiles(req.files);
+      console.error("App submission error:", error.message);
+
+      res.status(500).json({
+        error: "Could not save submission."
+      });
+    }
+  });
+});
+
+// Admin pending apps
+app.get("/api/admin/apps", requireAuth, requireAdmin, (req, res) => {
+  res.json({
+    apps: q.pending.all()
+  });
+});
+
+// Admin review
+app.patch("/api/admin/apps/:id", requireAuth, requireAdmin, (req, res) => {
+  const status = String(req.body.status || "");
+
+  if (!["approved", "rejected"].includes(status)) {
+    return res.status(400).json({
+      error: "Status must be approved or rejected."
+    });
+  }
+
+  const note = String(req.body.reviewNote || "").slice(0, 500);
+
+  const result = q.review.run(status, note, req.params.id);
+
+  if (!result.changes) {
+    return res.status(404).json({
+      error: "Pending submission not found."
+    });
+  }
+
+  res.json({
+    ok: true,
+    status
+  });
+});
+
+// Download approved APK
+app.get("/api/apps/:id/download", (req, res) => {
+  const appRow = q.appById.get(req.params.id);
+
+  if (!appRow || appRow.status !== "approved") {
+    return res.status(404).json({
+      error: "Approved app not found."
+    });
+  }
+
+  const filePath = path.join(
+    UPLOADS,
+    path.basename(appRow.apk_file)
+  );
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({
+      error: "APK file missing."
+    });
+  }
+
+  res.download(
+    filePath,
+    appRow.apk_original_name.replace(/[^a-zA-Z0-9._-]/g, "_")
+  );
+});
+
+// Render health check
+app.get("/api/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    status: "healthy"
+  });
+});
+
+// Frontend
+app.use(express.static(path.join(ROOT, "public")));
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error(err);
+
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  res.status(500).json({
+    error: "Unexpected server error."
+  });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`iModStore server running on port ${PORT}`);
+});
