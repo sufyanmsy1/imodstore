@@ -10,7 +10,13 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const admin = require("firebase-admin");
-const nodemailer = require("nodemailer");
+let nodemailer;
+try {
+  nodemailer = require("nodemailer");
+} catch (err) {
+  console.error("Missing dependency: nodemailer. Ensure package.json with nodemailer is in Render Root Directory and redeploy both files together.");
+  throw err;
+}
 
 const app = express();
 
