@@ -279,8 +279,62 @@ function requireAdmin(req, res, next) {
 function safeUser(user) {
   return { id: user.id, email: user.email, isAdmin: user.is_admin === true || user.is_admin === 1 };
 }
+function sanitizeIconSvg(input) {
+  const source = String(input || "").trim();
+  if (!source) return "";
+  if (source.length > 10000 || !/^<svg\b/i.test(source) || /<!DOCTYPE|<!ENTITY|<script\b|<style\b|<foreignObject\b|<iframe\b|<image\b|<use\b|<a\b|javascript:|data:|url\s*\(/i.test(source)) {
+    throw new Error("ICON_SVG_INVALID");
+  }
+  const allowedTags = new Set(["svg", "g", "path", "circle", "rect", "line", "polyline", "polygon", "ellipse"]);
+  const allowedAttrs = new Set(["xmlns", "viewBox", "width", "height", "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "fill-rule", "clip-rule", "opacity", "d", "cx", "cy", "r", "rx", "ry", "x", "y", "x1", "x2", "y1", "y2", "points", "transform"]);
+  const safeValue = (name, value) => {
+    if (name === "xmlns") return value === "http://www.w3.org/2000/svg";
+    if (["fill", "stroke"].includes(name)) return /^(none|currentColor|#[0-9a-f]{3,8}|[a-z]{1,20})$/i.test(value);
+    if (name === "d") return /^[MmZzLlHhVvCcSsQqTtAaEe0-9.,+\-\s]*$/.test(value);
+    if (name === "points") return /^[0-9.,+\-\s]*$/.test(value);
+    if (name === "transform") return /^(translate|scale|rotate)\([0-9.,+\-\s]*\)(\s+(translate|scale|rotate)\([0-9.,+\-\s]*\))*$/.test(value);
+    if (["stroke-width", "opacity", "cx", "cy", "r", "rx", "ry", "x", "y", "x1", "x2", "y1", "y2", "width", "height"].includes(name)) return /^[0-9.]+(%|px)?$/.test(value);
+    if (["stroke-linecap", "stroke-linejoin"].includes(name)) return /^(butt|round|square|miter|bevel)$/.test(value);
+    if (["fill-rule", "clip-rule"].includes(name)) return /^(nonzero|evenodd)$/.test(value);
+    if (name === "viewBox") return /^[0-9.\-+\s]+$/.test(value);
+    return false;
+  };
+  const token = /<\/?([a-zA-Z][a-zA-Z0-9:-]*)\b([^>]*)>/g;
+  let out = "", last = 0, match, stack = [], rootSeen = false;
+  while ((match = token.exec(source))) {
+    if (source.slice(last, match.index).trim()) throw new Error("ICON_SVG_INVALID");
+    last = token.lastIndex;
+    const closing = match[0].startsWith("</");
+    const tag = match[1];
+    if (!allowedTags.has(tag)) throw new Error("ICON_SVG_INVALID");
+    if (closing) {
+      if (match[2].trim() || stack.pop() !== tag) throw new Error("ICON_SVG_INVALID");
+      out += `</${tag}>`;
+      continue;
+    }
+    if (tag === "svg") {
+      if (rootSeen || stack.length) throw new Error("ICON_SVG_INVALID");
+      rootSeen = true;
+    } else if (!rootSeen || !stack.length) throw new Error("ICON_SVG_INVALID");
+    let attrsText = match[2].replace(/\/\s*$/, "").trim();
+    let attrs = "", consumed = "", attrRegex = /([a-zA-Z][a-zA-Z0-9:-]*)\s*=\s*("([^"]*)"|'([^']*)')/g, a;
+    while ((a = attrRegex.exec(attrsText))) {
+      const name = a[1], value = a[3] !== undefined ? a[3] : a[4];
+      if (!allowedAttrs.has(name) || !safeValue(name, value)) throw new Error("ICON_SVG_INVALID");
+      consumed += a[0];
+      attrs += ` ${name}="${value.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}"`;
+    }
+    if (attrsText.replace(attrRegex, "").trim()) throw new Error("ICON_SVG_INVALID");
+    const selfClosing = /\/\s*$/.test(match[2]) || ["path", "circle", "rect", "line", "polyline", "polygon", "ellipse"].includes(tag);
+    out += `<${tag}${attrs}${selfClosing ? "/>" : ">"}`;
+    if (!selfClosing) stack.push(tag);
+  }
+  if (source.slice(last).trim() || !rootSeen || stack.length || !out.startsWith("<svg")) throw new Error("ICON_SVG_INVALID");
+  return out;
+}
+
 function publicApp(appRow) {
-  return { id: appRow.id, name: appRow.name, category: appRow.category, description: appRow.description, version: appRow.version || "", rating: appRow.rating || "New", size: appRow.download_url ? "MediaFire" : (Number(appRow.size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB", iconUrl: appRow.icon_file ? "/api/icons/" + encodeURIComponent(appRow.id) + "/" + encodeURIComponent(path.basename(appRow.icon_file)) : null };
+  return { id: appRow.id, name: appRow.name, category: appRow.category, description: appRow.description, version: appRow.version || "", rating: appRow.rating || "New", size: appRow.download_url ? "MediaFire" : (Number(appRow.size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB", iconUrl: appRow.icon_file ? "/api/icons/" + encodeURIComponent(appRow.id) + "/" + encodeURIComponent(path.basename(appRow.icon_file)) : null, iconHtml: appRow.icon_html || null };
 }
 
 function removeFiles(files) {
@@ -852,60 +906,43 @@ const upload = multer({
   }
 });
 
-// Submit app using a MediaFire share URL instead of uploading the APK.
+// Submit app using a MediaFire share URL and safe inline SVG icon markup.
 app.post("/api/apps", requireAuth, (req, res) => {
-  upload.fields([{ name: "icon", maxCount: 1 }])(req, res, async err => {
-    if (err) {
-      removeFiles(req.files);
-      return res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "File too large. Maximum upload size is 100 MB." : err.message });
-    }
-
-    let iconPath = null;
+  upload.none()(req, res, async err => {
+    if (err) return res.status(400).json({ error: "Invalid form submission." });
     try {
       const name = String(req.body.name || "").trim();
       const category = String(req.body.category || "");
       const description = String(req.body.description || "").trim();
       const version = String(req.body.version || "").trim();
       const downloadUrl = String(req.body.downloadUrl || "").trim();
-      const icon = req.files?.icon?.[0];
+      let iconHtml = "";
+      try { iconHtml = sanitizeIconSvg(req.body.iconHtml || ""); }
+      catch (_) { return res.status(400).json({ error: "Icon must be safe SVG markup (up to 10 KB). Scripts, styles, external links, and arbitrary HTML are not allowed." }); }
 
       let parsedUrl;
       try { parsedUrl = new URL(downloadUrl); } catch (_) {}
       if (!parsedUrl || parsedUrl.protocol !== "https:" || !["mediafire.com", "www.mediafire.com", "mfi.re"].includes(parsedUrl.hostname.toLowerCase())) {
-        removeFiles(req.files);
         return res.status(400).json({ error: "Enter a valid HTTPS MediaFire share link." });
       }
-      if (!name || name.length > 70 || !allowedCats.has(category) || !description || description.length > 500 || downloadUrl.length > 2048) {
-        removeFiles(req.files);
-        return res.status(400).json({ error: "Check the app name, category, description, and MediaFire link." });
-      }
-      if (icon && icon.size > 2 * 1024 * 1024) {
-        removeFiles(req.files);
-        return res.status(400).json({ error: "App icon must be 2 MB or smaller." });
+      if (!name || name.length > 70 || !allowedCats.has(category) || !description || description.length > 500 || downloadUrl.length > 2048 || version.length > 30) {
+        return res.status(400).json({ error: "Check the app name, category, description, version, and MediaFire link." });
       }
 
       const id = crypto.randomUUID();
-      if (icon) {
-        if (!supabaseUrl || !supabaseServiceKey) throw new Error("SUPABASE_NOT_CONFIGURED");
-        iconPath = `${id}/${crypto.randomUUID()}${path.extname(icon.originalname).toLowerCase()}`;
-        await uploadToSupabase(icon.path, iconPath, icon.mimetype || "application/octet-stream");
-      }
       const owner = await userById(req.session.userId);
       if (!owner) throw new Error("SESSION_USER_NOT_FOUND");
       await saveApp({
         id, owner_id: req.session.userId, owner_email: owner.email,
-        name, category, description, version: version.slice(0, 30),
-        icon_file: iconPath, apk_file: null, download_url: downloadUrl,
+        name, category, description, version,
+        icon_file: null, icon_html: iconHtml || null, apk_file: null, download_url: downloadUrl,
         apk_original_name: "", size_bytes: 0, status: "pending", rating: "New",
         review_note: "", created_at: new Date().toISOString(), reviewed_at: null
       });
-      removeFiles(req.files);
       return res.status(201).json({ ok: true, id, status: "pending" });
     } catch (error) {
-      removeFiles(req.files);
-      if (iconPath) await deleteSupabaseObjects([iconPath]);
       console.error("App submission error:", error.message);
-      return res.status(error.message === "SUPABASE_NOT_CONFIGURED" ? 503 : 500).json({ error: error.message === "SUPABASE_NOT_CONFIGURED" ? "Supabase Storage is not configured for app icons." : "Could not save submission. Check server logs." });
+      return res.status(500).json({ error: "Could not save submission. Check server logs." });
     }
   });
 });
