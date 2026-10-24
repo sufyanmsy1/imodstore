@@ -9,6 +9,8 @@ const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const admin = require("firebase-admin");
+const nodemailer = require("nodemailer");
 
 const app = express();
 
@@ -29,6 +31,16 @@ if (!sessionSecret || sessionSecret.length < 32) {
   console.error("ERROR: SESSION_SECRET must be at least 32 characters.");
   process.exit(1);
 }
+
+const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "/etc/secrets/firebase-service-account.json";
+if (!fs.existsSync(serviceAccountPath)) {
+  console.error("ERROR: Firebase service account secret file was not found:", serviceAccountPath);
+  process.exit(1);
+}
+const serviceAccount = require(serviceAccountPath);
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+const firestore = admin.firestore();
+const otpCollection = firestore.collection("otp_challenges");
 
 const db = new Database(path.join(DATA, "imodstore.sqlite"));
 
@@ -162,10 +174,18 @@ app.use(session({
   }
 }));
 
-// Email configuration via Resend API (Node 22 includes fetch).
-// Set RESEND_API_KEY and RESEND_FROM in Render Environment Variables.
-const resendApiKey = process.env.RESEND_API_KEY;
-const resendFrom = process.env.RESEND_FROM;
+// Email delivery uses the existing SMTP variables configured in Render.
+const smtpHost = process.env.SMTP_HOST;
+const smtpPort = Number(process.env.SMTP_PORT || 587);
+const smtpUser = process.env.SMTP_USER;
+const smtpPass = process.env.SMTP_PASS;
+const smtpFrom = process.env.SMTP_FROM || process.env.SMTP_USER;
+const mailer = (smtpHost && smtpUser && smtpPass && smtpFrom)
+  ? nodemailer.createTransport({
+      host: smtpHost, port: smtpPort, secure: smtpPort === 465,
+      auth: { user: smtpUser, pass: smtpPass }
+    })
+  : null;
 
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
@@ -250,109 +270,65 @@ function safeHashCompare(a, b) {
     crypto.timingSafeEqual(first, second);
 }
 
-async function sendOtp(email, purpose, otp) {
-  if (!resendApiKey || !resendFrom) {
-    throw new Error("RESEND_NOT_CONFIGURED");
-  }
-
-  const subject = purpose === "register"
-    ? "Your iModStore verification code"
-    : "Your iModStore password reset code";
-
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${resendApiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      from: resendFrom,
-      to: [email],
-      subject,
-      text: `Your iModStore verification code is ${otp}.\\n\\nIt expires in 10 minutes. Do not share this code with anyone.`,
-      html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto"><h2>iModStore</h2><p>Your verification code is:</p><div style="font-size:32px;font-weight:bold;letter-spacing:8px">${otp}</div><p>This code expires in 10 minutes.</p><p>If you did not request this code, ignore this email.</p></div>`
-    })
+async function getChallenge(email, purpose) {
+  const id = `${purpose}_${crypto.createHash("sha256").update(email).digest("hex")}`;
+  const snap = await otpCollection.doc(id).get();
+  return snap.exists ? snap.data() : null;
+}
+async function putChallenge(email, purpose, data) {
+  const id = `${purpose}_${crypto.createHash("sha256").update(email).digest("hex")}`;
+  await otpCollection.doc(id).set({ email, purpose, ...data });
+}
+async function removeChallenge(email, purpose) {
+  const id = `${purpose}_${crypto.createHash("sha256").update(email).digest("hex")}`;
+  await otpCollection.doc(id).delete();
+}
+async function incrementChallengeAttempts(email, purpose) {
+  const id = `${purpose}_${crypto.createHash("sha256").update(email).digest("hex")}`;
+  await firestore.runTransaction(async (tx) => {
+    const ref = otpCollection.doc(id);
+    const snap = await tx.get(ref);
+    if (snap.exists) tx.update(ref, { attempts: Number(snap.get("attempts") || 0) + 1 });
   });
-
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    console.error("Resend API error:", response.status, detail.slice(0, 500));
-    throw new Error("RESEND_SEND_FAILED");
-  }
+}
+async function sendOtp(email, purpose, otp) {
+  if (!mailer) throw new Error("SMTP_NOT_CONFIGURED");
+  const subject = purpose === "register" ? "Your iModStore verification code"
+    : purpose === "login" ? "Your iModStore login code" : "Your iModStore password reset code";
+  await mailer.sendMail({
+    from: smtpFrom, to: email, subject,
+    text: `Your iModStore verification code is ${otp}.\n\nIt expires in 10 minutes. Do not share this code with anyone.`,
+    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto"><h2>iModStore</h2><p>Your verification code is:</p><div style="font-size:32px;font-weight:bold;letter-spacing:8px">${otp}</div><p>This code expires in 10 minutes.</p><p>If you did not request this code, ignore this email.</p></div>`
+  });
 }
 
-const findChallenge = db.prepare(`
-  SELECT * FROM otp_challenges
-  WHERE email=? AND purpose=?
-`);
-
-const saveChallenge = db.prepare(`
-  INSERT INTO otp_challenges(
-    email,purpose,otp_hash,password_hash,
-    expires_at,last_sent_at,attempts
-  )
-  VALUES(?,?,?,?,?,?,0)
-  ON CONFLICT(email,purpose) DO UPDATE SET
-    otp_hash=excluded.otp_hash,
-    password_hash=excluded.password_hash,
-    expires_at=excluded.expires_at,
-    last_sent_at=excluded.last_sent_at,
-    attempts=0
-`);
-
-const deleteChallenge = db.prepare(`
-  DELETE FROM otp_challenges
-  WHERE email=? AND purpose=?
-`);
-
 async function createAndSendOtp(email, purpose, passwordHash = null) {
-  if (!resendApiKey || !resendFrom) {
-    throw new Error("RESEND_NOT_CONFIGURED");
-  }
-
+  if (!mailer) throw new Error("SMTP_NOT_CONFIGURED");
   const now = Date.now();
-  const existing = findChallenge.get(email, purpose);
-
-  // Resend cooldown: 60 seconds
-  if (existing && now - existing.last_sent_at < 60000) {
-    return {
-      ok: false,
-      error: "Please wait before requesting another OTP."
-    };
+  const existing = await getChallenge(email, purpose);
+  if (existing && now - Number(existing.last_sent_at) < 60000) {
+    return { ok: false, error: "Please wait before requesting another OTP." };
   }
-
-  const otp = crypto
-    .randomInt(0, 1000000)
-    .toString()
-    .padStart(6, "0");
-
-  const otpHash = hashOtp(email, purpose, otp);
-
-  saveChallenge.run(
-    email,
-    purpose,
-    otpHash,
-    passwordHash,
-    now + 10 * 60 * 1000,
-    now
-  );
-
+  const otp = crypto.randomInt(0, 1000000).toString().padStart(6, "0");
+  await putChallenge(email, purpose, {
+    otp_hash: hashOtp(email, purpose, otp), password_hash: passwordHash,
+    expires_at: now + 10 * 60 * 1000, last_sent_at: now, attempts: 0
+  });
   try {
     await sendOtp(email, purpose, otp);
   } catch (error) {
-    deleteChallenge.run(email, purpose);
+    await removeChallenge(email, purpose);
     throw error;
   }
-
   return { ok: true };
 }
 
 function smtpError(res, error) {
   console.error("Email OTP error:", error.message);
 
-  if (error.message === "RESEND_NOT_CONFIGURED") {
+  if (error.message === "SMTP_NOT_CONFIGURED") {
     return res.status(503).json({
-      error: "Resend email service is not configured. Please contact the administrator."
+      error: "SMTP email service is not configured. Please contact the administrator."
     });
   }
 
@@ -420,7 +396,7 @@ app.post("/api/auth/verify-otp", async (req, res) => {
       });
     }
 
-    const challenge = findChallenge.get(email, "register");
+    const challenge = await getChallenge(email, "register");
 
     if (!challenge) {
       return res.status(400).json({
@@ -429,7 +405,7 @@ app.post("/api/auth/verify-otp", async (req, res) => {
     }
 
     if (Date.now() > challenge.expires_at) {
-      deleteChallenge.run(email, "register");
+      await removeChallenge(email, "register");
 
       return res.status(400).json({
         error: "OTP expired. Please request a new code."
@@ -437,7 +413,7 @@ app.post("/api/auth/verify-otp", async (req, res) => {
     }
 
     if (challenge.attempts >= 5) {
-      deleteChallenge.run(email, "register");
+      await removeChallenge(email, "register");
 
       return res.status(429).json({
         error: "Too many incorrect attempts. Request a new OTP."
@@ -447,11 +423,7 @@ app.post("/api/auth/verify-otp", async (req, res) => {
     const submittedHash = hashOtp(email, "register", otp);
 
     if (!safeHashCompare(challenge.otp_hash, submittedHash)) {
-      db.prepare(`
-        UPDATE otp_challenges
-        SET attempts=attempts+1
-        WHERE email=? AND purpose='register'
-      `).run(email);
+      await incrementChallengeAttempts(email, "register");
 
       return res.status(400).json({
         error: "Incorrect OTP."
@@ -459,7 +431,7 @@ app.post("/api/auth/verify-otp", async (req, res) => {
     }
 
     if (!challenge.password_hash) {
-      deleteChallenge.run(email, "register");
+      await removeChallenge(email, "register");
 
       return res.status(400).json({
         error: "Registration session expired. Request a new OTP."
@@ -476,8 +448,6 @@ app.post("/api/auth/verify-otp", async (req, res) => {
         challenge.password_hash,
         0
       );
-
-      deleteChallenge.run(email, "register");
 
       return result.lastInsertRowid;
     });
@@ -496,6 +466,8 @@ app.post("/api/auth/verify-otp", async (req, res) => {
       throw error;
     }
 
+    await removeChallenge(email, "register");
+    await removeChallenge(email, "register");
     req.session.userId = userId;
 
     return res.json({
@@ -537,22 +509,22 @@ app.post("/api/auth/verify-login-otp", async (req, res) => {
     if (!validEmail(email) || !/^\d{6}$/.test(otp)) {
       return res.status(400).json({ error: "Enter a valid email address and 6-digit OTP." });
     }
-    const challenge = findChallenge.get(email, "login");
+    const challenge = await getChallenge(email, "login");
     if (!challenge) return res.status(400).json({ error: "Login code not found. Request a new code." });
     if (Date.now() > challenge.expires_at) {
-      deleteChallenge.run(email, "login");
+      await removeChallenge(email, "login");
       return res.status(400).json({ error: "Login code expired. Request a new code." });
     }
     if (challenge.attempts >= 5) {
-      deleteChallenge.run(email, "login");
+      await removeChallenge(email, "login");
       return res.status(429).json({ error: "Too many incorrect attempts. Request a new OTP." });
     }
     if (!safeHashCompare(challenge.otp_hash, hashOtp(email, "login", otp))) {
-      db.prepare("UPDATE otp_challenges SET attempts=attempts+1 WHERE email=? AND purpose='login'").run(email);
+      await incrementChallengeAttempts(email, "login");
       return res.status(400).json({ error: "Incorrect login code." });
     }
     const user = q.userByEmail.get(email);
-    deleteChallenge.run(email, "login");
+    await removeChallenge(email, "login");
     if (!user) return res.status(400).json({ error: "Account not found. Please create an account first." });
     req.session.regenerate((err) => {
       if (err) return res.status(500).json({ error: "Could not create a login session." });
@@ -715,7 +687,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
       });
     }
 
-    const challenge = findChallenge.get(email, "reset");
+    const challenge = await getChallenge(email, "reset");
 
     if (!challenge) {
       return res.status(400).json({
@@ -724,7 +696,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
     }
 
     if (Date.now() > challenge.expires_at) {
-      deleteChallenge.run(email, "reset");
+      await removeChallenge(email, "reset");
 
       return res.status(400).json({
         error: "Reset code expired. Request a new code."
@@ -732,7 +704,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
     }
 
     if (challenge.attempts >= 5) {
-      deleteChallenge.run(email, "reset");
+      await removeChallenge(email, "reset");
 
       return res.status(429).json({
         error: "Too many incorrect attempts. Request a new code."
@@ -742,11 +714,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
     const submittedHash = hashOtp(email, "reset", otp);
 
     if (!safeHashCompare(challenge.otp_hash, submittedHash)) {
-      db.prepare(`
-        UPDATE otp_challenges
-        SET attempts=attempts+1
-        WHERE email=? AND purpose='reset'
-      `).run(email);
+      await incrementChallengeAttempts(email, "reset");
 
       return res.status(400).json({
         error: "Incorrect reset code."
@@ -756,7 +724,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
     const user = q.userByEmail.get(email);
 
     if (!user) {
-      deleteChallenge.run(email, "reset");
+      await removeChallenge(email, "reset");
 
       return res.status(400).json({
         error: "Account not found."
@@ -772,10 +740,10 @@ app.post("/api/auth/reset-password", async (req, res) => {
         WHERE email=?
       `).run(passwordHash, email);
 
-      deleteChallenge.run(email, "reset");
     });
 
     updatePassword();
+    await removeChallenge(email, "reset");
 
     return res.json({
       ok: true,
