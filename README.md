@@ -33,3 +33,18 @@ Important:
 - This code does not use Firebase Authentication's built-in email OTP (Firebase does not provide a built-in custom 6-digit email OTP flow). It uses Firestore for OTP challenge storage and SMTP for delivery.
 - Existing SQLite user/app data remains in SQLite; this change only moves OTP challenge records to Firestore.
 - Never commit the service-account JSON, SMTP app password, or SESSION_SECRET to GitHub.
+iModStore Admin Panel
+
+Files:
+- server.js (updated with ADMIN_EMAIL bootstrap and admin stats endpoint)
+- public/admin.html (responsive admin dashboard)
+
+Setup:
+1. Replace repository root server.js with this server.js.
+2. Put public/admin.html in your repository's public/ folder.
+3. Ensure your normal website files remain in public/.
+4. In Render > Environment, add ADMIN_EMAIL with the exact email of an account already registered on iModStore. Do not put secrets in HTML or GitHub.
+5. Save changes and deploy. The server promotes only that exact existing account to admin when it starts. If the account is not registered yet, register it first, then restart/redeploy.
+6. Log in on the normal website, then open https://imodstore.onrender.com/admin.html
+
+Features: admin-only pending queue, app approve/reject with review note, counts for users/submissions/approved/rejected. API endpoints remain protected by server-side requireAdmin middleware.
