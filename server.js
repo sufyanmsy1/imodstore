@@ -118,23 +118,60 @@ async function updateAppReview(id, status, note) {
 }
 async function uploadToSupabase(localFile, storagePath, contentType) {
   if (!supabaseUrl || !supabaseServiceKey) throw new Error("SUPABASE_NOT_CONFIGURED");
-  const encodedPath = storagePath.split("/").map(encodeURIComponent).join("/");
-  const response = await fetch(`${supabaseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodedPath}`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${supabaseServiceKey}`,
-      "apikey": supabaseServiceKey,
-      "Content-Type": contentType || "application/octet-stream",
-      "x-upsert": "false"
-    },
-    body: await fs.promises.readFile(localFile)
-  });
-  const body = await response.text();
-  if (!response.ok) {
-    console.error("Supabase Storage upload error:", response.status, body.slice(0, 500));
-    throw new Error("SUPABASE_UPLOAD_FAILED");
+  const https = require("https");
+  const target = new URL(`${supabaseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${storagePath.split("/").map(encodeURIComponent).join("/")}`);
+  if (target.protocol !== "https:") throw new Error("SUPABASE_URL_MUST_USE_HTTPS");
+  const fileBuffer = await fs.promises.readFile(localFile);
+
+  // Use IPv4 explicitly for the storage request. Some hosted runtimes can
+  // resolve the Supabase host to IPv6 first and fail with undici's generic
+  // "fetch failed" even when the project URL and credentials are correct.
+  // Retry transient network failures, but never retry HTTP/API errors.
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const request = https.request({
+          protocol: target.protocol,
+          hostname: target.hostname,
+          port: target.port || 443,
+          path: target.pathname,
+          method: "POST",
+          family: 4,
+          timeout: 20000,
+          headers: {
+            "Authorization": `Bearer ${supabaseServiceKey}`,
+            "apikey": supabaseServiceKey,
+            "Content-Type": contentType || "application/octet-stream",
+            "Content-Length": fileBuffer.length,
+            "x-upsert": "false"
+          }
+        }, response => {
+          let responseBody = "";
+          response.setEncoding("utf8");
+          response.on("data", chunk => { responseBody += chunk; });
+          response.on("end", () => resolve({ status: response.statusCode || 0, body: responseBody }));
+        });
+        request.on("timeout", () => request.destroy(new Error("SUPABASE_REQUEST_TIMEOUT")));
+        request.on("error", reject);
+        request.end(fileBuffer);
+      });
+      if (result.status < 200 || result.status >= 300) {
+        console.error("Supabase Storage upload HTTP error:", result.status, result.body.slice(0, 500));
+        throw new Error(`SUPABASE_UPLOAD_HTTP_${result.status}`);
+      }
+      return storagePath;
+    } catch (error) {
+      lastError = error;
+      // HTTP errors are actionable API responses; retrying will not fix them.
+      if (/^SUPABASE_UPLOAD_HTTP_/.test(error.message)) throw error;
+      console.error(`Supabase Storage network attempt ${attempt}/3 failed:`, error.code || error.message, "host:", target.hostname);
+      if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 700));
+    }
   }
-  return storagePath;
+  const failure = new Error("SUPABASE_NETWORK_FAILED");
+  failure.cause = lastError;
+  throw failure;
 }
 async function createStorageSignedUrl(storagePath, expiresIn = 300) {
   if (!supabaseUrl || !supabaseServiceKey) throw new Error("SUPABASE_NOT_CONFIGURED");
