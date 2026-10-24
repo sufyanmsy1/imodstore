@@ -5,7 +5,6 @@ const multer = require("multer");
 const bcrypt = require("bcryptjs");
 const session = require("express-session");
 const SQLiteStore = require("connect-sqlite3")(session);
-const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
@@ -17,7 +16,7 @@ app.disable("x-powered-by");
 
 const PORT = Number(process.env.PORT || 8080);
 const ROOT = __dirname;
-const DATA = process.env.DATA_DIR || path.join(ROOT, "data");
+const DATA = path.join(ROOT, "data");
 const UPLOADS = path.join(ROOT, "uploads");
 
 fs.mkdirSync(DATA, { recursive: true });
@@ -40,114 +39,133 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const firestore = admin.firestore();
 const otpCollection = firestore.collection("otp_challenges");
 
-const db = new Database(path.join(DATA, "imodstore.sqlite"));
+// Persistent application data lives in Firestore. SQLite is used only by the
+// express-session store on Render Free; sessions may expire after restarts.
+const usersCollection = firestore.collection("users");
+const appsCollection = firestore.collection("apps");
+const bucketName = String(process.env.SUPABASE_BUCKET || "imodstore-files").trim();
+const supabaseUrl = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
-db.pragma("journal_mode = WAL");
-
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY,
-  email TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  is_admin INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS apps (
-  id TEXT PRIMARY KEY,
-  owner_id INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  category TEXT NOT NULL,
-  description TEXT NOT NULL,
-  version TEXT,
-  icon_file TEXT,
-  apk_file TEXT NOT NULL,
-  apk_original_name TEXT NOT NULL,
-  size_bytes INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  rating TEXT DEFAULT 'New',
-  review_note TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  reviewed_at TEXT,
-  FOREIGN KEY(owner_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS otp_challenges (
-  email TEXT NOT NULL,
-  purpose TEXT NOT NULL,
-  otp_hash TEXT NOT NULL,
-  password_hash TEXT,
-  expires_at INTEGER NOT NULL,
-  last_sent_at INTEGER NOT NULL,
-  attempts INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY(email, purpose)
-);
-
-CREATE INDEX IF NOT EXISTS idx_apps_status
-ON apps(status);
-`);
-
-const q = {
-  userByEmail: db.prepare(
-    "SELECT * FROM users WHERE email = ?"
-  ),
-
-  userById: db.prepare(
-    "SELECT id,email,is_admin AS isAdmin FROM users WHERE id = ?"
-  ),
-
-  insertUser: db.prepare(
-    "INSERT INTO users(email,password_hash,is_admin) VALUES(?,?,?)"
-  ),
-
-  insertApp: db.prepare(`
-    INSERT INTO apps(
-      id,owner_id,name,category,description,version,
-      icon_file,apk_file,apk_original_name,size_bytes,status
-    )
-    VALUES(
-      @id,@owner_id,@name,@category,@description,@version,
-      @icon_file,@apk_file,@apk_original_name,@size_bytes,'pending'
-    )
-  `),
-
-  publicApps: db.prepare(`
-    SELECT id,name,category,description,version,rating,
-    size_bytes,icon_file
-    FROM apps
-    WHERE status='approved'
-    ORDER BY created_at DESC
-  `),
-
-  appById: db.prepare(
-    "SELECT * FROM apps WHERE id=?"
-  ),
-
-  pending: db.prepare(`
-    SELECT a.id,a.name,a.category,a.description,a.version,
-    a.created_at AS createdAt,u.email AS ownerEmail
-    FROM apps a
-    JOIN users u ON u.id=a.owner_id
-    WHERE a.status='pending'
-    ORDER BY a.created_at ASC
-  `),
-
-  review: db.prepare(`
-    UPDATE apps
-    SET status=?,review_note=?,reviewed_at=CURRENT_TIMESTAMP
-    WHERE id=? AND status='pending'
-  `)
-};
-
-// Promote only the explicitly configured account to admin.
-// Set ADMIN_EMAIL in Render to an email that has already registered.
-const configuredAdminEmail = normalizeEmail(process.env.ADMIN_EMAIL);
-if (configuredAdminEmail) {
-  const promoteAdmin = db.prepare("UPDATE users SET is_admin=1 WHERE email=?");
-  const result = promoteAdmin.run(configuredAdminEmail);
-  if (result.changes) console.log(`Admin access enabled for ${configuredAdminEmail}`);
-  else console.log(`ADMIN_EMAIL is configured; register ${configuredAdminEmail} first, then redeploy/restart.`);
+function userDocId(email) {
+  return crypto.createHash("sha256").update(normalizeEmail(email)).digest("hex");
 }
+function userFromDoc(doc) {
+  if (!doc || !doc.exists) return null;
+  return { id: doc.id, ...doc.data(), isAdmin: doc.get("is_admin") === true || doc.get("is_admin") === 1 };
+}
+async function userByEmail(email) {
+  const normalized = normalizeEmail(email);
+  const direct = await usersCollection.doc(userDocId(normalized)).get();
+  if (direct.exists) return userFromDoc(direct);
+  const snap = await usersCollection.where("email", "==", normalized).limit(1).get();
+  return snap.empty ? null : userFromDoc(snap.docs[0]);
+}
+async function userById(id) {
+  if (!id) return null;
+  const snap = await usersCollection.doc(String(id)).get();
+  return userFromDoc(snap);
+}
+async function createUser(email, passwordHash, isAdmin = false) {
+  const normalized = normalizeEmail(email);
+  const id = userDocId(normalized);
+  const ref = usersCollection.doc(id);
+  return firestore.runTransaction(async tx => {
+    const existing = await tx.get(ref);
+    if (existing.exists) {
+      const error = new Error("EMAIL_EXISTS");
+      throw error;
+    }
+    const user = {
+      email: normalized,
+      password_hash: passwordHash,
+      is_admin: !!isAdmin || (!!configuredAdminEmail && normalized === configuredAdminEmail),
+      created_at: new Date().toISOString()
+    };
+    tx.create(ref, user);
+    return { id, ...user };
+  });
+}
+async function promoteConfiguredAdmin() {
+  if (!configuredAdminEmail) return;
+  const user = await userByEmail(configuredAdminEmail);
+  if (!user) {
+    console.log(`ADMIN_EMAIL is configured; register ${configuredAdminEmail} first, then restart.`);
+    return;
+  }
+  await usersCollection.doc(user.id).set({ is_admin: true }, { merge: true });
+  console.log(`Admin access enabled for ${configuredAdminEmail}`);
+}
+async function listApps() {
+  const snap = await appsCollection.get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+async function getAppById(id) {
+  const snap = await appsCollection.doc(String(id)).get();
+  return snap.exists ? { id: snap.id, ...snap.data() } : null;
+}
+async function saveApp(appRow) {
+  await appsCollection.doc(appRow.id).create(appRow);
+}
+async function updateAppReview(id, status, note) {
+  const ref = appsCollection.doc(String(id));
+  return firestore.runTransaction(async tx => {
+    const snap = await tx.get(ref);
+    if (!snap.exists || snap.get("status") !== "pending") return false;
+    tx.update(ref, { status, review_note: note, reviewed_at: new Date().toISOString() });
+    return true;
+  });
+}
+async function uploadToSupabase(localFile, storagePath, contentType) {
+  if (!supabaseUrl || !supabaseServiceKey) throw new Error("SUPABASE_NOT_CONFIGURED");
+  const encodedPath = storagePath.split("/").map(encodeURIComponent).join("/");
+  const response = await fetch(`${supabaseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodedPath}`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${supabaseServiceKey}`,
+      "apikey": supabaseServiceKey,
+      "Content-Type": contentType || "application/octet-stream",
+      "x-upsert": "false"
+    },
+    body: await fs.promises.readFile(localFile)
+  });
+  const body = await response.text();
+  if (!response.ok) {
+    console.error("Supabase Storage upload error:", response.status, body.slice(0, 500));
+    throw new Error("SUPABASE_UPLOAD_FAILED");
+  }
+  return storagePath;
+}
+async function createStorageSignedUrl(storagePath, expiresIn = 300) {
+  if (!supabaseUrl || !supabaseServiceKey) throw new Error("SUPABASE_NOT_CONFIGURED");
+  const encodedPath = String(storagePath).split("/").map(encodeURIComponent).join("/");
+  const response = await fetch(`${supabaseUrl}/storage/v1/object/sign/${encodeURIComponent(bucketName)}/${encodedPath}`, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${supabaseServiceKey}`, "apikey": supabaseServiceKey, "Content-Type": "application/json" },
+    body: JSON.stringify({ expiresIn })
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.signedURL) {
+    console.error("Supabase signed URL error:", response.status, JSON.stringify(body).slice(0, 500));
+    throw new Error("SUPABASE_SIGNED_URL_FAILED");
+  }
+  return body.signedURL.startsWith("http") ? body.signedURL : `${supabaseUrl}/storage/v1${body.signedURL}`;
+}
+async function deleteSupabaseObjects(paths) {
+  const objects = (paths || []).filter(Boolean).map(name => ({ name }));
+  if (!objects.length || !supabaseUrl || !supabaseServiceKey) return;
+  try {
+    await fetch(`${supabaseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}`, {
+      method: "DELETE",
+      headers: { "Authorization": `Bearer ${supabaseServiceKey}`, "apikey": supabaseServiceKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ prefixes: objects.map(o => o.name) })
+    });
+  } catch (_) {}
+}
+
+// Promote the configured account now and on every successful registration.
+const configuredAdminEmail = normalizeEmail(process.env.ADMIN_EMAIL);
+promoteConfiguredAdmin().catch(error => console.error("Admin promotion check failed:", error.message));
 
 const allowedCats = new Set([
   "Games", "Productivity", "Photography", "Education",
@@ -204,44 +222,28 @@ function requireAuth(req, res, next) {
   next();
 }
 
-function currentUser(req) {
-  return req.session.userId
-    ? q.userById.get(req.session.userId)
-    : null;
+async function currentUser(req) {
+  return req.session.userId ? userById(req.session.userId) : null;
 }
 
 function requireAdmin(req, res, next) {
-  const user = currentUser(req);
-
-  if (!user || !user.isAdmin) {
-    return res.status(403).json({
-      error: "Admin access required."
-    });
-  }
-
-  next();
+  currentUser(req).then(user => {
+    if (!user || !(user.is_admin === true || user.is_admin === 1)) {
+      return res.status(403).json({ error: "Admin access required." });
+    }
+    req.currentUser = user;
+    next();
+  }).catch(error => {
+    console.error("Admin check failed:", error.message);
+    res.status(500).json({ error: "Could not verify admin access." });
+  });
 }
 
 function safeUser(user) {
-  return {
-    id: user.id,
-    email: user.email,
-    isAdmin: !!user.is_admin
-  };
+  return { id: user.id, email: user.email, isAdmin: user.is_admin === true || user.is_admin === 1 };
 }
 function publicApp(appRow) {
-  return {
-    id: appRow.id,
-    name: appRow.name,
-    category: appRow.category,
-    description: appRow.description,
-    version: appRow.version || "",
-    rating: appRow.rating || "New",
-    size: (appRow.size_bytes / 1024 / 1024).toFixed(1) + " MB",
-    iconUrl: appRow.icon_file
-      ? "/api/icons/" + path.basename(appRow.icon_file)
-      : null
-  };
+  return { id: appRow.id, name: appRow.name, category: appRow.category, description: appRow.description, version: appRow.version || "", rating: appRow.rating || "New", size: (Number(appRow.size_bytes || 0) / 1024 / 1024).toFixed(1) + " MB", iconUrl: appRow.icon_file ? "/api/icons/" + encodeURIComponent(appRow.id) + "/" + encodeURIComponent(path.basename(appRow.icon_file)) : null };
 }
 
 function removeFiles(files) {
@@ -372,7 +374,7 @@ app.post("/api/auth/request-otp", async (req, res) => {
       });
     }
 
-    if (q.userByEmail.get(email)) {
+    if (await userByEmail(email)) {
       return res.status(409).json({
         error: "An account with this email already exists."
       });
@@ -455,67 +457,21 @@ app.post("/api/auth/verify-otp", async (req, res) => {
       });
     }
 
-    const insert = db.transaction(() => {
-      if (q.userByEmail.get(email)) {
-        throw new Error("EMAIL_EXISTS");
-      }
-
-      // Grant admin only to the email explicitly configured on the server.
-      const isAdmin = email === normalizeEmail(process.env.ADMIN_EMAIL) ? 1 : 0;
-      const result = q.insertUser.run(
-        email,
-        challenge.password_hash,
-        isAdmin
-      );
-
-      return result.lastInsertRowid;
-    });
-
-    let userId;
-
+    let user;
     try {
-      userId = insert();
+      user = await createUser(email, challenge.password_hash, email === configuredAdminEmail);
     } catch (error) {
       if (error.message === "EMAIL_EXISTS") {
-        return res.status(409).json({
-          error: "An account with this email already exists."
-        });
+        return res.status(409).json({ error: "An account with this email already exists." });
       }
-
       throw error;
     }
 
     await removeChallenge(email, "register");
-
-    // Persist the login session before telling the browser registration succeeded.
-    req.session.regenerate((sessionError) => {
-      if (sessionError) {
-        console.error("Registration session error:", sessionError.message);
-        return res.status(500).json({
-          error: "Account was created, but login session could not be created. Please log in."
-        });
-      }
-
-      req.session.userId = userId;
-      req.session.save((saveError) => {
-        if (saveError) {
-          console.error("Registration session save error:", saveError.message);
-          return res.status(500).json({
-            error: "Account was created, but login session could not be saved. Please log in."
-          });
-        }
-
-        return res.json({
-          ok: true,
-          message: "Account created successfully.",
-          user: {
-            id: userId,
-            email,
-            isAdmin: email === normalizeEmail(process.env.ADMIN_EMAIL)
-          }
-        });
-      });
-    });
+    req.session.userId = user.id;
+    await new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve()));
+    if (email === configuredAdminEmail) console.log(`Admin access enabled for ${email}`);
+    return res.json({ ok: true, message: "Account created successfully.", user: safeUser(user) });
   } catch (error) {
     console.error("OTP verification error:", error.message);
 
@@ -529,7 +485,7 @@ app.post("/api/auth/request-login-otp", async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email);
     if (!validEmail(email)) return res.status(400).json({ error: "Enter a valid email address." });
-    const user = q.userByEmail.get(email);
+    const user = await userByEmail(email);
     if (!user) return res.json({ ok: true, message: "If an account exists, a login code will be sent." });
     const result = await createAndSendOtp(email, "login");
     if (!result.ok) return res.status(429).json({ error: result.error });
@@ -561,7 +517,7 @@ app.post("/api/auth/verify-login-otp", async (req, res) => {
       await incrementChallengeAttempts(email, "login");
       return res.status(400).json({ error: "Incorrect login code." });
     }
-    const user = q.userByEmail.get(email);
+    const user = await userByEmail(email);
     await removeChallenge(email, "login");
     if (!user) return res.status(400).json({ error: "Account not found. Please create an account first." });
     req.session.regenerate((err) => {
@@ -590,7 +546,7 @@ app.post("/api/auth/login", async (req, res) => {
       });
     }
 
-    const user = q.userByEmail.get(email);
+    const user = await userByEmail(email);
 
     if (!user || !(await bcrypt.compare(password, user.password_hash))) {
       return res.status(401).json({
@@ -635,8 +591,8 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 // Current logged-in user
-app.get("/api/auth/me", (req, res) => {
-  const user = currentUser(req);
+app.get("/api/auth/me", async (req, res) => {
+  const user = await currentUser(req);
 
   if (!user) {
     return res.status(401).json({
@@ -646,7 +602,7 @@ app.get("/api/auth/me", (req, res) => {
 
   return res.json({
     ok: true,
-    user
+    user: safeUser(user)
   });
 });
 
@@ -679,7 +635,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       });
     }
 
-    const user = q.userByEmail.get(email);
+    const user = await userByEmail(email);
 
     // Avoid revealing whether an email is registered.
     if (!user) {
@@ -759,7 +715,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
       });
     }
 
-    const user = q.userByEmail.get(email);
+    const user = await userByEmail(email);
 
     if (!user) {
       await removeChallenge(email, "reset");
@@ -771,16 +727,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
 
-    const updatePassword = db.transaction(() => {
-      db.prepare(`
-        UPDATE users
-        SET password_hash=?
-        WHERE email=?
-      `).run(passwordHash, email);
-
-    });
-
-    updatePassword();
+    await usersCollection.doc(user.id).set({ password_hash: passwordHash }, { merge: true });
     await removeChallenge(email, "reset");
 
     return res.json({
@@ -804,23 +751,29 @@ app.post("/api/auth/register", (req, res) => {
   });
 });
 // Public apps
-app.get("/api/apps", (req, res) => {
-  res.json({
-    apps: q.publicApps.all().map(publicApp)
-  });
+app.get("/api/apps", async (req, res) => {
+  try {
+    const rows = (await listApps()).filter(row => row.status === "approved").sort((a,b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+    res.json({ apps: rows.map(publicApp) });
+  } catch (error) {
+    console.error("Public apps query failed:", error.message);
+    res.status(500).json({ error: "Could not load apps." });
+  }
 });
 
 // App icons
-app.get("/api/icons/:file", (req, res) => {
-  const file = path.basename(req.params.file);
-  const filePath = path.join(UPLOADS, file);
-
-  if (!fs.existsSync(filePath)) {
-    return res.sendStatus(404);
+app.get("/api/icons/:id/:file", async (req, res) => {
+  try {
+    const id = path.basename(req.params.id);
+    const file = path.basename(req.params.file);
+    const storagePath = `${id}/${file}`;
+    if (!id || !file || id.includes("..") || file.includes("..")) return res.sendStatus(404);
+    const signedUrl = await createStorageSignedUrl(storagePath, 3600);
+    res.redirect(302, signedUrl);
+  } catch (error) {
+    console.error("Icon retrieval failed:", error.message);
+    res.sendStatus(error.message === "SUPABASE_NOT_CONFIGURED" ? 503 : 404);
   }
-
-  res.setHeader("Cache-Control", "public, max-age=86400");
-  res.sendFile(filePath);
 });
 
 // Upload configuration
@@ -867,7 +820,7 @@ app.post("/api/apps", requireAuth, (req, res) => {
   upload.fields([
     { name: "apk", maxCount: 1 },
     { name: "icon", maxCount: 1 }
-  ])(req, res, err => {
+  ])(req, res, async err => {
     if (err) {
       removeFiles(req.files);
 
@@ -878,6 +831,7 @@ app.post("/api/apps", requireAuth, (req, res) => {
       });
     }
 
+    const uploadedStoragePaths = [];
     try {
       const name = String(req.body.name || "").trim();
       const category = String(req.body.category || "");
@@ -910,60 +864,80 @@ app.post("/api/apps", requireAuth, (req, res) => {
         });
       }
 
+      if (!supabaseUrl || !supabaseServiceKey) throw new Error("SUPABASE_NOT_CONFIGURED");
+      if (apk.size > 50 * 1024 * 1024) {
+        removeFiles(req.files);
+        return res.status(400).json({ error: "APK exceeds the Supabase bucket's 50 MB limit." });
+      }
       const id = crypto.randomUUID();
-
-      q.insertApp.run({
+      const apkPath = `${id}/${crypto.randomUUID()}${path.extname(apk.originalname).toLowerCase()}`;
+      await uploadToSupabase(apk.path, apkPath, "application/vnd.android.package-archive");
+      uploadedStoragePaths.push(apkPath);
+      let iconPath = null;
+      if (icon) {
+        iconPath = `${id}/${crypto.randomUUID()}${path.extname(icon.originalname).toLowerCase()}`;
+        const iconType = icon.mimetype || "application/octet-stream";
+        await uploadToSupabase(icon.path, iconPath, iconType);
+        uploadedStoragePaths.push(iconPath);
+      }
+      const owner = await userById(req.session.userId);
+      if (!owner) throw new Error("SESSION_USER_NOT_FOUND");
+      const appRow = {
         id,
         owner_id: req.session.userId,
+        owner_email: owner.email,
         name,
         category,
         description,
         version: version.slice(0, 30),
-        icon_file: icon ? icon.filename : null,
-        apk_file: apk.filename,
+        icon_file: iconPath,
+        apk_file: apkPath,
         apk_original_name: path.basename(apk.originalname),
-        size_bytes: apk.size
-      });
-
-      res.status(201).json({
-        ok: true,
-        id,
-        status: "pending"
-      });
+        size_bytes: apk.size,
+        status: "pending",
+        rating: "New",
+        review_note: "",
+        created_at: new Date().toISOString(),
+        reviewed_at: null
+      };
+      await saveApp(appRow);
+      removeFiles(req.files);
+      res.status(201).json({ ok: true, id, status: "pending" });
     } catch (error) {
       removeFiles(req.files);
+      await deleteSupabaseObjects(uploadedStoragePaths);
       console.error("App submission error:", error.message);
-
-      res.status(500).json({
-        error: "Could not save submission."
+      res.status(error.message === "SUPABASE_NOT_CONFIGURED" ? 503 : 500).json({
+        error: error.message === "SUPABASE_NOT_CONFIGURED" ? "Supabase Storage is not configured on the server." : "Could not save submission. Check server logs."
       });
     }
   });
 });
 
 // Admin dashboard summary
-app.get("/api/admin/stats", requireAuth, requireAdmin, (req, res) => {
-  const count = (sql) => db.prepare(sql).get().count;
-  res.json({
-    stats: {
-      totalUsers: count("SELECT COUNT(*) AS count FROM users"),
-      totalApps: count("SELECT COUNT(*) AS count FROM apps"),
-      pendingApps: count("SELECT COUNT(*) AS count FROM apps WHERE status='pending'"),
-      approvedApps: count("SELECT COUNT(*) AS count FROM apps WHERE status='approved'"),
-      rejectedApps: count("SELECT COUNT(*) AS count FROM apps WHERE status='rejected'")
-    }
-  });
+app.get("/api/admin/stats", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const [usersSnap, rows] = await Promise.all([usersCollection.get(), listApps()]);
+    res.json({ stats: { totalUsers: usersSnap.size, totalApps: rows.length, pendingApps: rows.filter(a=>a.status==="pending").length, approvedApps: rows.filter(a=>a.status==="approved").length, rejectedApps: rows.filter(a=>a.status==="rejected").length } });
+  } catch (error) {
+    console.error("Admin stats failed:", error.message);
+    res.status(500).json({ error: "Could not load admin statistics." });
+  }
 });
 
 // Admin pending apps
-app.get("/api/admin/apps", requireAuth, requireAdmin, (req, res) => {
-  res.json({
-    apps: q.pending.all()
-  });
+app.get("/api/admin/apps", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const rows = (await listApps()).filter(a => a.status === "pending").sort((a,b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+    res.json({ apps: rows.map(a => ({ id:a.id, name:a.name, category:a.category, description:a.description, version:a.version, createdAt:a.created_at, ownerEmail:a.owner_email || "" })) });
+  } catch (error) {
+    console.error("Admin app list failed:", error.message);
+    res.status(500).json({ error: "Could not load pending submissions." });
+  }
 });
 
 // Admin review
-app.patch("/api/admin/apps/:id", requireAuth, requireAdmin, (req, res) => {
+app.patch("/api/admin/apps/:id", requireAuth, requireAdmin, async (req, res) => {
   const status = String(req.body.status || "");
 
   if (!["approved", "rejected"].includes(status)) {
@@ -974,53 +948,39 @@ app.patch("/api/admin/apps/:id", requireAuth, requireAdmin, (req, res) => {
 
   const note = String(req.body.reviewNote || "").slice(0, 500);
 
-  const result = q.review.run(status, note, req.params.id);
-
-  if (!result.changes) {
-    return res.status(404).json({
-      error: "Pending submission not found."
-    });
+  try {
+    const changed = await updateAppReview(req.params.id, status, note);
+    if (!changed) return res.status(404).json({ error: "Pending submission not found." });
+    return res.json({ ok: true, status });
+  } catch (error) {
+    console.error("Admin review failed:", error.message);
+    return res.status(500).json({ error: "Could not update app review." });
   }
-
-  res.json({
-    ok: true,
-    status
-  });
 });
 
 // Download approved APK
-app.get("/api/apps/:id/download", (req, res) => {
-  const appRow = q.appById.get(req.params.id);
-
-  if (!appRow || appRow.status !== "approved") {
-    return res.status(404).json({
-      error: "Approved app not found."
-    });
+app.get("/api/apps/:id/download", async (req, res) => {
+  try {
+    const appRow = await getAppById(req.params.id);
+    if (!appRow || appRow.status !== "approved") return res.status(404).json({ error: "Approved app not found." });
+    const signedUrl = await createStorageSignedUrl(appRow.apk_file, 300);
+    res.redirect(302, signedUrl);
+  } catch (error) {
+    console.error("APK download failed:", error.message);
+    res.status(error.message === "SUPABASE_NOT_CONFIGURED" ? 503 : 404).json({ error: "APK file unavailable." });
   }
-
-  const filePath = path.join(
-    UPLOADS,
-    path.basename(appRow.apk_file)
-  );
-
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({
-      error: "APK file missing."
-    });
-  }
-
-  res.download(
-    filePath,
-    appRow.apk_original_name.replace(/[^a-zA-Z0-9._-]/g, "_")
-  );
 });
 
 // Render health check
-app.get("/api/health", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    status: "healthy"
-  });
+app.get("/api/health", async (req, res) => {
+  const configured = !!(supabaseUrl && supabaseServiceKey);
+  try {
+    await firestore.collection("_health").doc("check").set({ lastCheckAt: new Date().toISOString() }, { merge: true });
+    res.status(configured ? 200 : 503).json({ ok: configured, status: configured ? "healthy" : "storage_not_configured", database: "firestore", fileStorage: configured ? "supabase" : "not_configured" });
+  } catch (error) {
+    console.error("Health check failed:", error.message);
+    res.status(503).json({ ok: false, status: "unhealthy", database: "firestore", fileStorage: configured ? "supabase" : "not_configured" });
+  }
 });
 
 // Frontend
