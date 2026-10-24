@@ -306,8 +306,8 @@ const deleteChallenge = db.prepare(`
 `);
 
 async function createAndSendOtp(email, purpose, passwordHash = null) {
-  if (!transporter) {
-    throw new Error("SMTP_NOT_CONFIGURED");
+  if (!resendApiKey || !resendFrom) {
+    throw new Error("RESEND_NOT_CONFIGURED");
   }
 
   const now = Date.now();
@@ -514,6 +514,60 @@ app.post("/api/auth/verify-otp", async (req, res) => {
     });
   }
 });
+// Request login OTP (passwordless email login)
+app.post("/api/auth/request-login-otp", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    if (!validEmail(email)) return res.status(400).json({ error: "Enter a valid email address." });
+    const user = q.userByEmail.get(email);
+    if (!user) return res.json({ ok: true, message: "If an account exists, a login code will be sent." });
+    const result = await createAndSendOtp(email, "login");
+    if (!result.ok) return res.status(429).json({ error: result.error });
+    return res.json({ ok: true, message: "If an account exists, a login code will be sent." });
+  } catch (error) {
+    return smtpError(res, error);
+  }
+});
+
+// Verify login OTP and create a session
+app.post("/api/auth/verify-login-otp", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    const otp = String(req.body.otp || "").trim();
+    if (!validEmail(email) || !/^\d{6}$/.test(otp)) {
+      return res.status(400).json({ error: "Enter a valid email address and 6-digit OTP." });
+    }
+    const challenge = findChallenge.get(email, "login");
+    if (!challenge) return res.status(400).json({ error: "Login code not found. Request a new code." });
+    if (Date.now() > challenge.expires_at) {
+      deleteChallenge.run(email, "login");
+      return res.status(400).json({ error: "Login code expired. Request a new code." });
+    }
+    if (challenge.attempts >= 5) {
+      deleteChallenge.run(email, "login");
+      return res.status(429).json({ error: "Too many incorrect attempts. Request a new OTP." });
+    }
+    if (!safeHashCompare(challenge.otp_hash, hashOtp(email, "login", otp))) {
+      db.prepare("UPDATE otp_challenges SET attempts=attempts+1 WHERE email=? AND purpose='login'").run(email);
+      return res.status(400).json({ error: "Incorrect login code." });
+    }
+    const user = q.userByEmail.get(email);
+    deleteChallenge.run(email, "login");
+    if (!user) return res.status(400).json({ error: "Account not found. Please create an account first." });
+    req.session.regenerate((err) => {
+      if (err) return res.status(500).json({ error: "Could not create a login session." });
+      req.session.userId = user.id;
+      req.session.save((saveError) => {
+        if (saveError) return res.status(500).json({ error: "Could not save your login session." });
+        return res.json({ ok: true, message: "Login successful.", user: safeUser(user) });
+      });
+    });
+  } catch (error) {
+    console.error("OTP login error:", error.message);
+    return res.status(500).json({ error: "Could not verify login code. Please try again." });
+  }
+});
+
 // Login
 app.post("/api/auth/login", async (req, res) => {
   try {
