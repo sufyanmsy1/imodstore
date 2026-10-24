@@ -10,14 +10,6 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const admin = require("firebase-admin");
-let nodemailer;
-try {
-  nodemailer = require("nodemailer");
-} catch (err) {
-  console.error("Missing dependency: nodemailer. Ensure package.json with nodemailer is in Render Root Directory and redeploy both files together.");
-  throw err;
-}
-
 const app = express();
 
 app.set("trust proxy", 1);
@@ -180,18 +172,9 @@ app.use(session({
   }
 }));
 
-// Email delivery uses the existing SMTP variables configured in Render.
-const smtpHost = process.env.SMTP_HOST;
-const smtpPort = Number(process.env.SMTP_PORT || 587);
-const smtpUser = process.env.SMTP_USER;
-const smtpPass = process.env.SMTP_PASS;
-const smtpFrom = process.env.SMTP_FROM || process.env.SMTP_USER;
-const mailer = (smtpHost && smtpUser && smtpPass && smtpFrom)
-  ? nodemailer.createTransport({
-      host: smtpHost, port: smtpPort, secure: smtpPort === 465,
-      auth: { user: smtpUser, pass: smtpPass }
-    })
-  : null;
+// Email delivery uses Resend HTTPS API (avoids SMTP connection timeouts).
+const resendApiKey = process.env.RESEND_API_KEY;
+const resendFrom = process.env.RESEND_FROM || process.env.EMAIL_FROM;
 
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
@@ -298,18 +281,36 @@ async function incrementChallengeAttempts(email, purpose) {
   });
 }
 async function sendOtp(email, purpose, otp) {
-  if (!mailer) throw new Error("SMTP_NOT_CONFIGURED");
+  if (!resendApiKey || !resendFrom) throw new Error("RESEND_NOT_CONFIGURED");
+
   const subject = purpose === "register" ? "Your iModStore verification code"
     : purpose === "login" ? "Your iModStore login code" : "Your iModStore password reset code";
-  await mailer.sendMail({
-    from: smtpFrom, to: email, subject,
-    text: `Your iModStore verification code is ${otp}.\n\nIt expires in 10 minutes. Do not share this code with anyone.`,
-    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto"><h2>iModStore</h2><p>Your verification code is:</p><div style="font-size:32px;font-weight:bold;letter-spacing:8px">${otp}</div><p>This code expires in 10 minutes.</p><p>If you did not request this code, ignore this email.</p></div>`
+
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${resendApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      from: resendFrom,
+      to: [email],
+      subject,
+      text: `Your iModStore verification code is ${otp}.\n\nIt expires in 10 minutes. Do not share this code with anyone.`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto"><h2>iModStore</h2><p>Your verification code is:</p><div style="font-size:32px;font-weight:bold;letter-spacing:8px">${otp}</div><p>This code expires in 10 minutes.</p><p>If you did not request this code, ignore this email.</p></div>`
+    })
   });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    console.error("Resend API error:", response.status, responseText.slice(0, 1000));
+    const err = new Error("RESEND_API_ERROR");
+    err.status = response.status;
+    throw err;
+  }
 }
 
 async function createAndSendOtp(email, purpose, passwordHash = null) {
-  if (!mailer) throw new Error("SMTP_NOT_CONFIGURED");
   const now = Date.now();
   const existing = await getChallenge(email, purpose);
   if (existing && now - Number(existing.last_sent_at) < 60000) {
@@ -329,17 +330,17 @@ async function createAndSendOtp(email, purpose, passwordHash = null) {
   return { ok: true };
 }
 
-function smtpError(res, error) {
+function emailSendError(res, error) {
   console.error("Email OTP error:", error.message);
 
-  if (error.message === "SMTP_NOT_CONFIGURED") {
+  if (error.message === "RESEND_NOT_CONFIGURED") {
     return res.status(503).json({
-      error: "SMTP email service is not configured. Please contact the administrator."
+      error: "Resend email service is not configured. Please contact the administrator."
     });
   }
 
   return res.status(502).json({
-    error: "Could not send the email. Please try again later."
+    error: "Could not send the email. Check Render logs for the Resend API error."
   });
 }
 
@@ -386,7 +387,7 @@ app.post("/api/auth/request-otp", async (req, res) => {
       message: "Verification code sent to your email."
     });
   } catch (error) {
-    return smtpError(res, error);
+    return emailSendError(res, error);
   }
 });
 
@@ -503,7 +504,7 @@ app.post("/api/auth/request-login-otp", async (req, res) => {
     if (!result.ok) return res.status(429).json({ error: result.error });
     return res.json({ ok: true, message: "If an account exists, a login code will be sent." });
   } catch (error) {
-    return smtpError(res, error);
+    return emailSendError(res, error);
   }
 });
 
@@ -670,7 +671,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       message: "If the account exists, a reset code will be sent."
     });
   } catch (error) {
-    return smtpError(res, error);
+    return emailSendError(res, error);
   }
 });
 
