@@ -17,7 +17,7 @@ app.disable("x-powered-by");
 
 const PORT = Number(process.env.PORT || 8080);
 const ROOT = __dirname;
-const DATA = path.join(ROOT, "data");
+const DATA = process.env.DATA_DIR || path.join(ROOT, "data");
 const UPLOADS = path.join(ROOT, "uploads");
 
 fs.mkdirSync(DATA, { recursive: true });
@@ -460,10 +460,12 @@ app.post("/api/auth/verify-otp", async (req, res) => {
         throw new Error("EMAIL_EXISTS");
       }
 
+      // Grant admin only to the email explicitly configured on the server.
+      const isAdmin = email === normalizeEmail(process.env.ADMIN_EMAIL) ? 1 : 0;
       const result = q.insertUser.run(
         email,
         challenge.password_hash,
-        0
+        isAdmin
       );
 
       return result.lastInsertRowid;
@@ -484,16 +486,35 @@ app.post("/api/auth/verify-otp", async (req, res) => {
     }
 
     await removeChallenge(email, "register");
-    await removeChallenge(email, "register");
-    req.session.userId = userId;
 
-    return res.json({
-      ok: true,
-      message: "Account created successfully.",
-      user: {
-        id: userId,
-        email
+    // Persist the login session before telling the browser registration succeeded.
+    req.session.regenerate((sessionError) => {
+      if (sessionError) {
+        console.error("Registration session error:", sessionError.message);
+        return res.status(500).json({
+          error: "Account was created, but login session could not be created. Please log in."
+        });
       }
+
+      req.session.userId = userId;
+      req.session.save((saveError) => {
+        if (saveError) {
+          console.error("Registration session save error:", saveError.message);
+          return res.status(500).json({
+            error: "Account was created, but login session could not be saved. Please log in."
+          });
+        }
+
+        return res.json({
+          ok: true,
+          message: "Account created successfully.",
+          user: {
+            id: userId,
+            email,
+            isAdmin: email === normalizeEmail(process.env.ADMIN_EMAIL)
+          }
+        });
+      });
     });
   } catch (error) {
     console.error("OTP verification error:", error.message);
