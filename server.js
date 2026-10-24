@@ -1004,7 +1004,9 @@ app.get("/api/health", (req, res) => {
 
 // Frontend
 app.use(express.static(path.join(ROOT, "public")));
-
+app.get("/admin.html", (req, res) => {
+  res.sendFile(path.join(ROOT, "public", "admin.html"));
+});
 // Error handler
 app.use((err, req, res, next) => {
   console.error(err);
