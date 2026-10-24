@@ -1,93 +1,35 @@
-# iModStore backend starter
+iModStore Firebase Firestore OTP backend
 
-This package is the next development step for your custom-domain app marketplace. It includes a frontend and a small Node.js backend with account registration/login, SQLite database, APK/icon upload, and an admin approval queue.
+Files:
+- server.js: Express backend updated to store OTP challenges in Firestore and send email using configured SMTP.
+- package.json: includes firebase-admin and nodemailer.
+- public/index.html: existing OTP-capable frontend.
 
-## Run on a computer (recommended for first setup)
-Requirements: Node.js 20+ and npm.
+Before deploying:
+1. Commit these files to your GitHub repository, keeping the existing project structure.
+2. Render Environment variables:
+   - SESSION_SECRET: existing secret, minimum 32 characters.
+   - FIREBASE_SERVICE_ACCOUNT_PATH=/etc/secrets/firebase-service-account.json
+   - SMTP_HOST=smtp.gmail.com
+   - SMTP_PORT=587
+   - SMTP_USER=your Gmail address
+   - SMTP_PASS=your Google App Password (not normal Gmail password)
+   - SMTP_FROM=your Gmail address
+3. Render Secret Files:
+   - Filename: firebase-service-account.json
+   - Contents: the full Firebase service-account JSON downloaded from Firebase Console.
+4. Ensure Firebase project ID in the service account JSON is "imodestore".
+5. In Firestore, server-side Admin SDK uses the collection "otp_challenges". Do not create public read/write rules; Admin SDK accesses Firestore with service-account privileges.
+6. Deploy latest commit and inspect Render logs.
 
-1. Extract the ZIP.
-2. Open a terminal in the `iModStore_Backend_Starter` folder.
-3. Install dependencies:
-   ```bash
-   npm install
-   ```
-4. Copy `.env.example` to `.env`.
-5. Replace `SESSION_SECRET` with a random secret of at least 32 characters.
-6. Start the server:
-   ```bash
-   npm start
-   ```
-7. Open `http://localhost:8080`.
+OTP behavior:
+- 6-digit codes
+- 10-minute expiry
+- 60-second resend cooldown
+- maximum 5 verification attempts
+- OTP hashes stored in Firestore; the raw code is only sent by email.
 
-## Make the first account an admin
-1. Register an account in the website.
-2. Stop the server.
-3. Open `data/imodstore.sqlite` with a SQLite browser or CLI.
-4. Find your user ID:
-   ```sql
-   SELECT id, email, is_admin FROM users;
-   ```
-5. Promote only your own account:
-   ```sql
-   UPDATE users SET is_admin = 1 WHERE email = 'YOUR-EMAIL-HERE';
-   ```
-6. Restart the server and log in again. The Admin panel will appear.
-
-Do not expose an unauthenticated admin setup route on a public server.
-
-## Current functionality
-- User registration and login using hashed passwords
-- Session cookies (HttpOnly, SameSite=Lax)
-- App metadata and uploaded APK/icon files stored on server
-- Every user submission starts as `pending`
-- Public store only shows `approved` listings
-- Admin-only pending queue with approve/reject actions
-- Download route serves only approved APKs
-- SQLite database and health endpoint (`/api/health`)
-
-## Important security and production limitations
-This is a starter, not production-ready. Before public launch:
-- Add CSRF protection and rate limiting for authentication and uploads.
-- Put the app behind HTTPS; set `NODE_ENV=production` and configure secure cookies.
-- Scan APKs with a maintained malware scanner before review/approval.
-- Verify APK content/signature rather than trusting the `.apk` extension.
-- Use a durable object storage service for APKs and icons; local disk may be ephemeral on cloud hosts.
-- Add moderation audit logs, report/takedown workflow, privacy policy, terms, and data deletion flow.
-- Set strict upload limits, quotas, monitoring, backups, and database migrations.
-- Add anti-spam/email verification and password reset.
-- Review the deployment platform's support for SQLite and persistent disk.
-- For multiple server instances, use shared session storage and shared file storage.
-- Never allow unauthorized users to mark their own submissions approved.
-
-## Domain and hosting
-A domain is not included or purchased by this ZIP. First deploy to a host that supports Node.js and persistent storage (or adapt this to a managed database/object storage), then connect your domain DNS and enable HTTPS. Domain availability and pricing must be checked with a registrar.
-
-## Upload limits
-The server currently allows an APK up to 100 MB and an optional icon up to 100 MB due to a global multer limit. For production, lower icon limits to about 2 MB and tune the APK limit to your needs. Run security checks before serving any uploaded APK.
-
-## API overview
-- `POST /api/auth/register`
-- `POST /api/auth/login`
-- `GET /api/auth/me`
-- `POST /api/auth/logout`
-- `GET /api/apps` (approved listings only)
-- `POST /api/apps` (authenticated multipart submission)
-- `GET /api/admin/apps` (admin only)
-- `PATCH /api/admin/apps/:id` (admin only)
-- `GET /api/apps/:id/download` (approved apps only)
-- `GET /api/health`
-
-
-## All-in-one UI features included
-- Responsive iPhone-inspired glass UI and mobile bottom navigation
-- 19 app categories, search, Top charts, Kids and New & updated views
-- Device-local favorites/wishlist and app reviews with star ratings
-- App detail views and download-start progress animation
-- Profile overview, settings, dark mode, privacy center and update notices
-- Admin review panel with pending-submission summary
-
-## Important prototype limitations
-Favorites and reviews are stored in the visitor's browser only; the update panel is an in-app list, not push notifications. The download progress bar is a UI animation while the browser handles the real download. This starter does not yet include production malware scanning, email verification, rate limiting, CSRF protection, durable cloud object storage, or a self-service account deletion flow. Do not launch publicly until those are added and tested.
-
-
-Android/GitHub note: this bundle keeps the website file at the repository root so the files can be selected together from a mobile file picker. Do not upload the ZIP itself as the only repository file; extract it first and upload the extracted files.
+Important:
+- This code does not use Firebase Authentication's built-in email OTP (Firebase does not provide a built-in custom 6-digit email OTP flow). It uses Firestore for OTP challenge storage and SMTP for delivery.
+- Existing SQLite user/app data remains in SQLite; this change only moves OTP challenge records to Firestore.
+- Never commit the service-account JSON, SMTP app password, or SESSION_SECRET to GitHub.
